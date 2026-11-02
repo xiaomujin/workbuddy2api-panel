@@ -2035,20 +2035,35 @@ type CreditBatch struct {
 // ResourceSnapshot 一次余额查询的完整结果。两套到期口径**并存且允许不相等**，
 // 这是有意为之：
 //
-//   - Expiring / EarliestAt / EarliestRemaining 基于 CycleEndTime（周期边界），是
-//     选号 prefer_expiring / expiringNow 的唯一依据，语义与引入时逐字一致；
+//   - Expiring / Expiring24h / Expiring72h / EarliestAt / EarliestRemaining 基于
+//     CycleEndTime（周期边界），是选号到期偏好（三档加权 + 濒临作废硬层）的唯一依据；
 //   - Batches 基于 packageExpiry（DeductionEndTime 优先，真失效时刻），只供面板
 //     「积分到期提醒」展示，与 CreditPackages 的逐包口径同源。
 //
 // **不要把两者合并**：合并会让「改卡片颜色」这类改动静默改变选号行为。
 type ResourceSnapshot struct {
-	Remain            int64
-	Total             int64
-	Expiring          int64
+	Remain   int64
+	Total    int64
+	Expiring int64
+	// Expiring24h / Expiring72h 路由口径的到期分档：分别统计「now+24h / now+72h 内
+	// 到期」的余额。与 Expiring 同源（CycleEndTime），供 pool 的到期紧迫度分档使用
+	// （快档 ×6 / 中档 ×4 / 慢档 ×3）。三档都是 Remain 的子集，且
+	// Expiring24h ≤ Expiring72h。窗口 soon 小于分档窗口时，分档不再细分（由 pool 侧
+	// 按 expiring_soon 判定），此处仍按固定窗口统计。
+	Expiring24h       int64
+	Expiring72h       int64
 	EarliestAt        time.Time
 	EarliestRemaining int64
 	Batches           []CreditBatch
 }
+
+// ExpiryBucketFast / ExpiryBucketMid 路由口径的到期分档窗口。
+// 与 pool 的默认 expiryPolicy 窗口一致（策略参数是常量，不接 config）；两侧同步性
+// 由 scheduler 包的 TestExpiryBucketWindowsInSync 守住。
+const (
+	ExpiryBucketFast = 24 * time.Hour
+	ExpiryBucketMid  = 72 * time.Hour
+)
 
 // mergeBatches 按到期时刻升序合并同刻批次（同一时刻的多个包合成一批，与
 // EarliestRemaining 的求和语义一致），并剔除零/负剩余。
@@ -2285,6 +2300,13 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 			// 分桶：仅 soon>0 且确实在窗口内 → expiring。
 			if soon > 0 && !end.After(now.Add(soon)) {
 				snap.Expiring += r
+			}
+			// 分档：固定 24h/72h 窗口，供 pool 的紧迫度分层（快/中/慢）使用。
+			if !end.After(now.Add(ExpiryBucketFast)) {
+				snap.Expiring24h += r
+			}
+			if !end.After(now.Add(ExpiryBucketMid)) {
+				snap.Expiring72h += r
 			}
 		}
 		// 展示口径：真失效时刻（DeductionEndTime 优先），与 CreditPackages 同源。

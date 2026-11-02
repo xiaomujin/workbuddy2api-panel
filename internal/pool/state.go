@@ -142,6 +142,8 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
 		e.creditsExpiring = 0
+		e.creditsExpiring24h = 0
+		e.creditsExpiring72h = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
 		p.dirty.Store(true)
@@ -579,6 +581,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,
+		CreditsExpiring24h:       e.creditsExpiring24h,
+		CreditsExpiring72h:       e.creditsExpiring72h,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
 		CreditsBatches:           e.creditsBatches,

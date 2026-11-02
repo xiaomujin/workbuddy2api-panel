@@ -78,7 +78,11 @@ type Status struct {
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
 	// 注意：以上三者是**路由口径**（CycleEndTime），供 pickEarliestExpiry /
 	// prefer_expiring 使用，**不得**用于展示。展示请用 CreditsBatches。
-	CreditsExpiring          int64     `json:"credits_expiring,omitempty"`
+	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
+	// CreditsExpiring24h / CreditsExpiring72h 路由口径到期分档（快/中档金额），
+	// 供运维核对「为什么这个号被优先选中」——与 CreditsExpiring 同源、均为其子集。
+	CreditsExpiring24h       int64     `json:"credits_expiring_24h,omitempty"`
+	CreditsExpiring72h       int64     `json:"credits_expiring_72h,omitempty"`
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
 	// CreditsBatches 逐批到期快照（**展示口径**，DeductionEndTime 优先），按到期
@@ -199,7 +203,12 @@ type entry struct {
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
 	// creditsEarliestExpiry / creditsEarliestRemaining 是全部未来到期批次中的最早一批；
 	// 两者均由签到/余额刷新更新，供 earliest-expiry 路由和状态观测使用。
-	creditsExpiring          int64
+	creditsExpiring int64
+	// creditsExpiring24h / creditsExpiring72h 路由口径到期分档（creditsExpiring 的
+	// 子集，24h ≤ 72h）。由余额快照写入；缺失（旧快照/旧 state.json）= 0，此时
+	// 到期偏好退化为「只有慢档 ×3」，与引入分档前的行为一致。
+	creditsExpiring24h       int64
+	creditsExpiring72h       int64
 	creditsEarliestExpiry    time.Time
 	creditsEarliestRemaining int64
 	// creditsBatches 逐批到期快照（展示口径，DeductionEndTime 优先），升序。
@@ -476,6 +485,12 @@ type stateAccount struct {
 	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留到期路由
 	// （最早到期路由）的偏好——重启后到下次签到之间不应失忆。
 	CreditsExpiring int64 `json:"credits_expiring"`
+	// CreditsExpiring24h / CreditsExpiring72h 路由口径到期分档。与 CreditsExpiring
+	// 同源（CycleEndTime 口径）一并持久化：重启后到下次余额刷新之间，紧迫度分层
+	// 不应失忆（否则冷启动会把快过期号当普通号，白白放走窗口）。缺字段 = 0 →
+	// 退化为只有慢档，方向安全。
+	CreditsExpiring24h int64 `json:"credits_expiring_24h,omitempty"`
+	CreditsExpiring72h int64 `json:"credits_expiring_72h,omitempty"`
 	// CreditsEarliestExpiry / CreditsEarliestRemaining 最早未来到期批次及剩余量。
 	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`

@@ -57,9 +57,15 @@ type Pool struct {
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
-	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
-	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
+	// preferExpiring 到期偏好总开关（默认 true）。关闭后选号完全回到"余额 + 闲置"
+	// 的普通加权（无三档、无硬层、无虚拟实例），即引入到期偏好前的行为。
 	preferExpiring bool
+	// expiringWindow 快过期窗口（来自 config pool.expiring_soon，由 main 注入）。
+	// 三档只在窗口 ≥ MidWindow 时细分；窗口更窄时退化为单档（SlowFactor），
+	// 避免"窗口外积分被固定 72h 桶算进中档"这种自相矛盾的加权。
+	expiringWindow time.Duration
+	// expiryPol 到期偏好策略参数（默认见 DefaultExpiryPolicy；SetExpiryPolicy 注入）。
+	expiryPol ExpiryPolicy
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -97,6 +103,8 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		expiringWindow:     defaultExpiringWindow,
+		expiryPol:          DefaultExpiryPolicy(),
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -190,11 +198,37 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	}
 }
 
-// SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
+// SetPreferExpiring 注入到期偏好总开关（main 从 config 解析后调用）。
 func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+}
+
+// SetExpiringWindow 注入快过期窗口（main 用 config pool.expiring_soon 注入）。
+// 0/负值 = 不启用（与 config 的"0 关闭"语义一致）。
+func (p *Pool) SetExpiringWindow(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d < 0 {
+		d = 0
+	}
+	p.expiringWindow = d
+}
+
+// SetExpiryPolicy 注入到期偏好策略（三档窗口/系数、占比倍数、上界、硬层阈值）。
+// 窗口/系数非法（≤0）时保留对应现值，避免手滑把策略关死。
+func (p *Pool) SetExpiryPolicy(pol ExpiryPolicy) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expiryPol = pol.normalized()
+}
+
+// ExpiryPolicy 返回当前生效的到期偏好策略（/status 与测试用）。
+func (p *Pool) ExpiryPolicy() ExpiryPolicy {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.expiryPol
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

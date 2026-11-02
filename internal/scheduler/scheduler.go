@@ -452,6 +452,8 @@ func toPoolCredits(snap upstream.ResourceSnapshot) pool.CreditsSnapshot {
 		Remain:            snap.Remain,
 		Total:             snap.Total,
 		Expiring:          snap.Expiring,
+		Expiring24h:       snap.Expiring24h,
+		Expiring72h:       snap.Expiring72h,
 		EarliestAt:        snap.EarliestAt,
 		EarliestRemaining: snap.EarliestRemaining,
 		Batches:           batches,

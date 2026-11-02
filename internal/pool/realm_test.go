@@ -76,7 +76,11 @@ func TestAvailableUIDsForModelRealm(t *testing.T) {
 func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
 	p := realmPool(t)
 	now := time.Now()
-	p.SetCreditsDetailed("cn2", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 100, EarliestAt: now.Add(time.Hour), EarliestRemaining: 100})
+	// 快档（24h 内到期）+ 该模型在 cn2 上收费的证据（虚拟实例的闸门与 pick 同口径）。
+	p.SetCreditsDetailed("cn2", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 100, Expiring24h: 100, Expiring72h: 100, EarliestAt: now.Add(time.Hour), EarliestRemaining: 100})
+	p.mu.Lock()
+	p.byUID["cn2"].modelCost = map[string]modelCostEntry{"glm-5.2": {CostPer1k: 1, LastSeen: now, Samples: 2}}
+	p.mu.Unlock()
 
 	got := p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
 	want := []string{"cn1", "cn2", "cn2", "cn2"}

@@ -268,29 +268,51 @@ func TestPickAntiThunderingHerd(t *testing.T) {
 }
 
 func TestPickLRUFallbackWhenTopAllRecentlyUsed(t *testing.T) {
-	// top5 全部刚被选中 → LRU 兜底应挑最近最少使用的那个（= 最早 lastUsed）。
+	// top5 全部刚被选中 → LRU 兜底在"最旧的 K 个"里加权抽签。
+	// 语义（issue：高并发下这条路径是主路径）：必须从最旧的一批里选，但不再退化成
+	// 严格轮转——余额/到期权重在兜底路径上依然生效。这里断言"最近用过的两个号
+	// 绝不被选中"，以及"最旧的一批都会被覆盖到"。
 	old := minPickGap
 	minPickGap = time.Hour // 超大窗口：任何 lastUsed 都在窗口内
 	defer func() { minPickGap = old }()
 
 	p := New("")
-	for i := 0; i < 5; i++ {
-		p.Add(&auth.Auth{UID: fmt.Sprintf("a%d", i)})
+	uids := []string{"a0", "a1", "a2", "a3", "a4", "a5", "a6"}
+	for _, uid := range uids {
+		p.Add(&auth.Auth{UID: uid})
+		p.SetCredits(uid, 100, 100)
 	}
-	// 直接构造 lastUsed：不经过 Pick（避免 Pick 改写 lastUsed）。
-	order := []string{"a4", "a3", "a2", "a1", "a0"}
+	// usedSeq 1..7：a0 最旧，a6 最新。LRU 兜底只在最旧 5 个（a0..a4）里抽签。
 	p.mu.Lock()
-	for i, uid := range order {
-		p.byUID[uid].lastUsed = time.Now().Add(-time.Duration(len(order)-i) * time.Second) // a4 最旧
+	for i, uid := range uids {
+		p.byUID[uid].lastUsed = time.Now()
+		p.byUID[uid].usedSeq = uint64(i + 1)
 	}
+	p.pickSeq = uint64(len(uids))
 	p.mu.Unlock()
 
-	got := p.Pick()
-	if got == nil {
-		t.Fatal("pick returned nil")
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		// 每轮重新求"最近用过的两个"：选中会把 usedSeq 顶到最新，集合会滚动。
+		p.mu.RLock()
+		newest := ""
+		for uid, e := range p.byUID {
+			if newest == "" || e.usedSeq > p.byUID[newest].usedSeq {
+				newest = uid
+			}
+		}
+		p.mu.RUnlock()
+		got := p.Pick()
+		if got == nil {
+			t.Fatal("pick returned nil")
+		}
+		if got.UID == newest {
+			t.Fatalf("LRU fallback picked the most recently used account %s", got.UID)
+		}
+		seen[got.UID] = true
 	}
-	if got.UID != "a4" {
-		t.Errorf("LRU fallback picked %s want a4 (oldest lastUsed)", got.UID)
+	if len(seen) < 2 {
+		t.Fatalf("LRU fallback collapsed to a single account: %v", seen)
 	}
 }
 
@@ -1748,17 +1770,23 @@ func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
 	p.Add(&auth.Auth{UID: "none"})
 
 	now := time.Now()
-	p.SetCreditsDetailed("later", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 100, EarliestAt: now.Add(48 * time.Hour), EarliestRemaining: 100})
-	p.SetCreditsDetailed("soon", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 100, EarliestAt: now.Add(2 * time.Hour), EarliestRemaining: 100})
+	p.SetCreditsDetailed("later", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 100, Expiring72h: 100, EarliestAt: now.Add(48 * time.Hour), EarliestRemaining: 100})
+	p.SetCreditsDetailed("soon", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 100, Expiring24h: 100, Expiring72h: 100, EarliestAt: now.Add(2 * time.Hour), EarliestRemaining: 100})
 	p.SetCreditsDetailed("none", CreditsSnapshot{Remain: 100, Total: 100})
+	// 闸门需要"该模型在号上确实收费"的证据（免费模型不给到期加权）。
+	p.mu.Lock()
+	for _, uid := range []string{"later", "soon", "none"} {
+		p.byUID[uid].modelCost = map[string]modelCostEntry{"m": {CostPer1k: 1, LastSeen: now, Samples: 2}}
+	}
+	p.mu.Unlock()
 
-	// 3:1 虚拟实例是软偏好而非硬优先。用确定性随机源统计长期分布：两个快过期
-	// 账号的合计份额应显著高于普通账号，同时普通账号仍保留少量流量。
+	// 到期加权是软偏好而非硬优先：用确定性随机源统计长期分布，两个快过期账号的
+	// 合计份额应显著高于普通账号，同时普通账号仍保留少量流量。
 	rng := rand.New(rand.NewPCG(1, 2))
 	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
 	counts := map[string]int{}
 	for i := 0; i < 2000; i++ {
-		got := p.Pick()
+		got := p.PickExcludingForModel(nil, "m")
 		if got == nil {
 			t.Fatal("pick returned nil")
 		}
@@ -1788,29 +1816,39 @@ func TestPickExpiringTieUsesExistingWeight(t *testing.T) {
 }
 
 func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
+	// 到期加权现在由 expiryBoostLocked 提供（含"该模型是否扣积分"的闸门与三档系数），
+	// 不再是旧的 routingWeightOf × 虚拟实例常数。
 	p := New("")
 	p.Add(&auth.Auth{UID: "a"})
 	p.Add(&auth.Auth{UID: "b"})
 	now := time.Now()
-	p.SetCreditsDetailed("a", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 50, EarliestAt: now.Add(time.Hour), EarliestRemaining: 50})
+	// a：24h 内到期 50（快档）；b：无到期。
+	p.SetCreditsDetailed("a", CreditsSnapshot{Remain: 100, Total: 100, Expiring: 50, Expiring24h: 50, Expiring72h: 50, EarliestAt: now.Add(time.Hour), EarliestRemaining: 50})
 	p.SetCreditsDetailed("b", CreditsSnapshot{Remain: 100, Total: 100})
-
+	// 闸门需要"该模型在该号上会扣积分"的证据：写一条 tier 2 观测。
 	p.mu.Lock()
-	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	for _, uid := range []string{"a", "b"} {
+		p.byUID[uid].modelCost = map[string]modelCostEntry{"m": {CostPer1k: 1, LastSeen: now, Samples: 2}}
+	}
+	_, ba := p.expiryBoostLocked(p.byUID["a"], "m", now)
+	_, bb := p.expiryBoostLocked(p.byUID["b"], "m", now)
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	// 快档 ×6，占比 min(1, 50/100×2)=1 → 6；无到期 → 1。
+	if ba != 6 {
+		t.Fatalf("enabled expiring boost=%v want 6", ba)
+	}
+	if bb != 1 {
+		t.Fatalf("non-expiring boost=%v want 1", bb)
 	}
 
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.routingWeightOf(p.byUID["a"], 100, now)
-	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	_, da := p.expiryBoostLocked(p.byUID["a"], "m", now)
+	_, db := p.expiryBoostLocked(p.byUID["b"], "m", now)
 	p.mu.Unlock()
-	if wa != wb {
-		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
+	if da != 1 || db != 1 {
+		t.Fatalf("disabled expiring boost=%v/%v want 1/1", da, db)
 	}
 }
 

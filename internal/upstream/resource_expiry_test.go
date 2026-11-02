@@ -51,6 +51,38 @@ func TestResourceBatchesUseDeductionEndTime(t *testing.T) {
 	}
 }
 
+// TestResourceExpiryBuckets 路由口径的 24h/72h 分档：三档都是 Remain 的子集，
+// 且 24h ⊆ 72h ⊆ 窗口。这是 pool 的「快/中/慢」紧迫度分层唯一的数据来源。
+func TestResourceExpiryBuckets(t *testing.T) {
+	base := time.Now().In(softRateResetLoc).Truncate(time.Second)
+	mk := func(remain int64, at time.Time) string {
+		return `{"PackageName":"p","CycleCapacitySize":` + strconv.FormatInt(remain, 10) + `,"CycleCapacityRemain":` + strconv.FormatInt(remain, 10) + `,"CycleCapacityUsed":0,"CycleEndTime":"` + at.Format(packageEndLayout) + `"}`
+	}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+
+			mk(10, base.Add(2*time.Hour))+","+
+			mk(20, base.Add(48*time.Hour))+","+
+			mk(30, base.Add(120*time.Hour))+
+			`]}}}}`), nil
+	})
+	snap, err := c.UserResourceDetailedWithExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, 168*time.Hour)
+	if err != nil {
+		t.Fatalf("resource: %v", err)
+	}
+	if snap.Remain != 60 || snap.Expiring != 60 {
+		t.Fatalf("remain/expiring=%d/%d want 60/60", snap.Remain, snap.Expiring)
+	}
+	if snap.Expiring24h != 10 {
+		t.Fatalf("expiring24h=%d want 10", snap.Expiring24h)
+	}
+	if snap.Expiring72h != 30 {
+		t.Fatalf("expiring72h=%d want 30", snap.Expiring72h)
+	}
+	if !(snap.Expiring24h <= snap.Expiring72h && snap.Expiring72h <= snap.Remain) {
+		t.Fatalf("分档必须单调且不超过总余额: %+v", snap)
+	}
+}
+
 // TestResourceBatchesMergeSameInstant 同一到期时刻的多个包合并成一批（与
 // EarliestRemaining 的「同一时刻求和」语义一致），且只统计未来 + 正余额。
 func TestResourceBatchesMergeSameInstant(t *testing.T) {

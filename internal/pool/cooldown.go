@@ -75,6 +75,11 @@ type CreditsSnapshot struct {
 	Remain            int64
 	Total             int64
 	Expiring          int64
+	// Expiring24h / Expiring72h 路由口径到期分档（与 Expiring 同源、均为其子集）。
+	// 供 expiryPolicy 的快/中档判定与「濒临作废」硬层阈值使用；缺失（旧快照/旧
+	// state.json）为 0，行为退化为「只有慢档」，不会误判成更急。
+	Expiring24h       int64
+	Expiring72h       int64
 	EarliestAt        time.Time
 	EarliestRemaining int64
 	Batches           []CreditBatch
@@ -176,9 +181,30 @@ func (p *Pool) SetCreditsDetailed(uid string, snap CreditsSnapshot) {
 		earliestAt = time.Time{}
 		earliestRemaining = 0
 	}
+	// 分档钳制：两档都是 credits 的子集，且 24h ≤ 72h（单调）。
+	// 不钳到 Expiring：expiring_soon 可以配得比 72h 还小（如 24h），那时「窗口内
+	// 总额」本来就小于分档金额，强行单调化会篡改配置语义。占比因子仍只认 Expiring。
+	exp24, exp72 := snap.Expiring24h, snap.Expiring72h
+	if exp24 < 0 {
+		exp24 = 0
+	}
+	if exp72 < 0 {
+		exp72 = 0
+	}
+	if exp24 > credits {
+		exp24 = credits
+	}
+	if exp72 > credits {
+		exp72 = credits
+	}
+	if exp24 > exp72 {
+		exp24 = exp72
+	}
 	e.credits = credits
 	e.creditsTotal = total
 	e.creditsExpiring = expiring
+	e.creditsExpiring24h = exp24
+	e.creditsExpiring72h = exp72
 	e.creditsEarliestExpiry = earliestAt
 	e.creditsEarliestRemaining = earliestRemaining
 	e.creditsBatches = normalizeBatches(snap.Batches, credits, now)
@@ -200,6 +226,8 @@ func (p *Pool) ClearExpiringSnapshots() {
 	defer p.mu.Unlock()
 	for _, e := range p.byUID {
 		e.creditsExpiring = 0
+		e.creditsExpiring24h = 0
+		e.creditsExpiring72h = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
 	}

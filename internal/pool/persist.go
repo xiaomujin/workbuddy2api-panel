@@ -149,6 +149,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount, schema int)
 			credits:                  s.Credits,
 			creditsTotal:             s.CreditsTotal,
 			creditsExpiring:          s.CreditsExpiring,
+			creditsExpiring24h:       s.CreditsExpiring24h,
+			creditsExpiring72h:       s.CreditsExpiring72h,
 			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
 			creditsEarliestRemaining: s.CreditsEarliestRemaining,
 			disabled:                 s.Disabled,
@@ -169,6 +171,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount, schema int)
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if !schemaOK {
 			e.creditsExpiring = 0
+			e.creditsExpiring24h = 0
+			e.creditsExpiring72h = 0
 			e.creditsEarliestExpiry = time.Time{}
 			e.creditsEarliestRemaining = 0
 			e.creditsBatches = nil
@@ -178,6 +182,23 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount, schema int)
 			}
 			if e.creditsExpiring > e.credits {
 				e.creditsExpiring = e.credits
+			}
+			// 分档钳制：0 ≤ 24h ≤ 72h ≤ credits（不钳到 creditsExpiring——
+			// expiring_soon 可配得比 72h 小，此时窗口总额本就小于分档金额）。
+			if e.creditsExpiring24h < 0 {
+				e.creditsExpiring24h = 0
+			}
+			if e.creditsExpiring72h < 0 {
+				e.creditsExpiring72h = 0
+			}
+			if e.creditsExpiring24h > e.credits {
+				e.creditsExpiring24h = e.credits
+			}
+			if e.creditsExpiring72h > e.credits {
+				e.creditsExpiring72h = e.credits
+			}
+			if e.creditsExpiring24h > e.creditsExpiring72h {
+				e.creditsExpiring24h = e.creditsExpiring72h
 			}
 			if e.creditsEarliestRemaining < 0 || e.creditsEarliestRemaining > e.credits {
 				e.creditsEarliestRemaining = 0
@@ -313,6 +334,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			SessionDeadFails:         e.sessionDeadFails,
 			ConsecutiveFails:         e.consecutiveFails,
 			CreditsExpiring:          e.creditsExpiring,
+			CreditsExpiring24h:       e.creditsExpiring24h,
+			CreditsExpiring72h:       e.creditsExpiring72h,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 			CreditsEarliestRemaining: e.creditsEarliestRemaining,
 			CreditsBatches:           e.creditsBatches,
