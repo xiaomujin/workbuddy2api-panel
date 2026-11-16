@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,6 +89,11 @@ type Scheduler struct {
 	retryMu   sync.Mutex
 	retries   []retryItem
 	retryWake chan struct{}
+
+	// balanceMu/balanceFailStreak 余额刷新连续失败计数（uid → 轮数），只用于日志降噪：
+	// 见 noteBalanceFailure。随账号数有界，进程内自愈，不落盘。
+	balanceMu         sync.Mutex
+	balanceFailStreak map[string]int
 }
 
 // New 构建。
@@ -113,6 +119,8 @@ func New(cfg Config) *Scheduler {
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		retryWake:     make(chan struct{}, 1),
+
+		balanceFailStreak: map[string]int{},
 	}
 }
 
@@ -550,8 +558,43 @@ func toPoolCredits(snap upstream.ResourceSnapshot) pool.CreditsSnapshot {
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
+// checkinRound 单轮签到统计（只为结尾那一行汇总而生，字段名即日志含义）。
+// 为什么要有汇总行：逐号行只记「这个号发生了什么」，翻日志回答不了「今天到底签成
+// 没有、有几个没签上」——而签到一天只有两轮，一行汇总的成本几乎为零。
+type checkinRound struct {
+	checked, ok, already, failed, rateLimited int
+	enterprise, balanceFailed, balanceRate    int
+}
+
+// summary 生成汇总行：全零段一律不出现（不编造"0 失败"这种冗余信息）。
+func (r checkinRound) summary() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "checkin 汇总: 签到 %d 号（成功 %d · 已签到 %d · 未签到 %d", r.checked, r.ok, r.already, r.failed)
+	if r.rateLimited > 0 {
+		fmt.Fprintf(&b, "，其中 429 %d 已排补跑", r.rateLimited)
+	}
+	b.WriteString("）")
+	if r.enterprise > 0 {
+		fmt.Fprintf(&b, " · 企业号 %d（不签到，只刷余额）", r.enterprise)
+	}
+	if r.balanceFailed > 0 {
+		fmt.Fprintf(&b, " · 余额查询失败 %d", r.balanceFailed)
+		if r.balanceRate > 0 {
+			fmt.Fprintf(&b, "（429 %d 已排补跑）", r.balanceRate)
+		}
+	}
+	return b.String()
+}
+
+// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
+// 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
+// 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
+// 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
+// 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
+// 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
 	includeDisabled := s.includeDisabledInTasks()
+	var r checkinRound
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -571,12 +614,18 @@ func (s *Scheduler) RunCheckinNow() {
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 		// credit_floor 判定与面板额度展示的唯一数据源）。
 		if !a.IsEnterprise() {
+			r.checked++
 			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 				if upstream.IsAlreadyCheckin(err) {
+					r.already++
 					s.cfg.Pool.NoteCheckinDone(st.UID)
 					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 				} else {
+					r.failed++
+					if isSoftRateErr(err) {
+						r.rateLimited++
+					}
 					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 					// 429：按上游的等待时长排一次补跑（见 retry.go）。其余错误不排。
 					s.noteRetryableErr(st.UID, retryCheckin, 0, err)
@@ -585,6 +634,7 @@ func (s *Scheduler) RunCheckinNow() {
 			} else {
 				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
 				// 重复触发时出现），成功也落一行。
+				r.ok++
 				s.cfg.Pool.NoteCheckinDone(st.UID)
 				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 			}
@@ -594,13 +644,22 @@ func (s *Scheduler) RunCheckinNow() {
 			if checkinBalanceGap > 0 {
 				time.Sleep(checkinBalanceGap)
 			}
+		} else {
+			r.enterprise++
 		}
 		// 分桶查余额（refreshBalanceOne：窗口内到期单独标记 + 逐批到期快照，口径见
 		// 该函数注释）。429 同样排一次补跑。
 		if err := s.refreshBalanceOne(a); err != nil {
+			r.balanceFailed++
+			if isSoftRateErr(err) {
+				r.balanceRate++
+			}
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			s.noteRetryableErr(st.UID, retryUserResource, 0, err)
 		}
+	}
+	if r.checked > 0 || r.enterprise > 0 {
+		log.Printf("%s", r.summary())
 	}
 	s.RunStreakBonusNow()
 }
@@ -750,6 +809,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	includeDisabled := s.includeDisabledInTasks()
 	sem := make(chan struct{}, balanceRefreshConcurrency)
 	var wg sync.WaitGroup
+	var total, failed, suppressed atomic.Int32
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -765,16 +825,64 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		}
 		first = false
 		sem <- struct{}{}
+		total.Add(1)
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if err := s.refreshBalanceOne(a); err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				failed.Add(1)
+				if streak := s.noteBalanceFailure(a, err); streak > 1 {
+					suppressed.Add(1)
+				}
+				return
 			}
+			s.noteBalanceSuccess(a)
 		}(a, st.UID)
 	}
 	wg.Wait()
+	s.logBalanceRound(total.Load(), failed.Load(), suppressed.Load())
+}
+
+// logBalanceRound 本轮失败汇总（一行替代 N 行）。只有一个号且是首次失败时不打——
+// 那一条明细自己已经把话说完了。
+func (s *Scheduler) logBalanceRound(total, failed, suppressed int32) {
+	if failed == 0 || (failed == 1 && suppressed == 0) {
+		return
+	}
+	msg := fmt.Sprintf("balance: 本轮 %d/%d 账号查询失败", failed, total)
+	if suppressed > 0 {
+		msg += fmt.Sprintf("，其中 %d 个连续失败只计数不重复打印", suppressed)
+	}
+	log.Printf("%s", msg)
+}
+
+// noteBalanceFailure 记录一次余额查询失败并返回该号的连续失败轮数。
+//
+// 降噪口径：连续失败只在**第 1 轮**打明细（那一轮是"新故障"，信息量最大），之后各轮
+// 只计数、由 logBalanceRound 汇总——余额刷新每 5 分钟一轮 × N 个号，一次上游限流就
+// 足以把日志刷满，反过来埋掉真正有信号的行（签到 / 旅行 / 保活 / 补跑）。恢复时由
+// noteBalanceSuccess 打一行「恢复」，所以「故障何时结束」也不会丢。
+func (s *Scheduler) noteBalanceFailure(a *auth.Auth, err error) int {
+	s.balanceMu.Lock()
+	s.balanceFailStreak[a.UID]++
+	n := s.balanceFailStreak[a.UID]
+	s.balanceMu.Unlock()
+	if n == 1 {
+		log.Printf("balance %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+	}
+	return n
+}
+
+// noteBalanceSuccess 清该号的连续失败计数；此前有失败时打一行恢复。
+func (s *Scheduler) noteBalanceSuccess(a *auth.Auth) {
+	s.balanceMu.Lock()
+	n := s.balanceFailStreak[a.UID]
+	delete(s.balanceFailStreak, a.UID)
+	s.balanceMu.Unlock()
+	if n > 0 {
+		log.Printf("balance %s: 恢复（连续失败 %d 轮后）", logfmt.Label(a.UID, a.Nickname), n)
+	}
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
