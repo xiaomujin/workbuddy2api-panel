@@ -82,6 +82,12 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// retryMu/retries/retryWake 任务侧 429 补跑队列（内存态，语义见 retry.go）。
+	// retryWake 是「队列变了」的通知：后台循环据此立即按最近到期重算，避免睡满巡检段。
+	retryMu   sync.Mutex
+	retries   []retryItem
+	retryWake chan struct{}
 }
 
 // New 构建。
@@ -106,6 +112,7 @@ func New(cfg Config) *Scheduler {
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
+		retryWake:     make(chan struct{}, 1),
 	}
 }
 
@@ -544,7 +551,6 @@ func toPoolCredits(snap upstream.ResourceSnapshot) pool.CreditsSnapshot {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
-	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -572,6 +578,8 @@ func (s *Scheduler) RunCheckinNow() {
 					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 				} else {
 					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+					// 429：按上游的等待时长排一次补跑（见 retry.go）。其余错误不排。
+					s.noteRetryableErr(st.UID, retryCheckin, 0, err)
 				}
 				// 其余业务错误也继续走余额查询
 			} else {
@@ -587,15 +595,12 @@ func (s *Scheduler) RunCheckinNow() {
 				time.Sleep(checkinBalanceGap)
 			}
 		}
-		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次
-		// （路由口径）与逐批到期快照（展示口径）。
-		snap, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-		if err != nil {
+		// 分桶查余额（refreshBalanceOne：窗口内到期单独标记 + 逐批到期快照，口径见
+		// 该函数注释）。429 同样排一次补跑。
+		if err := s.refreshBalanceOne(a); err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			continue
+			s.noteRetryableErr(st.UID, retryUserResource, 0, err)
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, snap.Remain, snap.Total)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, toPoolCredits(snap))
 	}
 	s.RunStreakBonusNow()
 }
@@ -707,6 +712,22 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
+// refreshBalanceOne 查询单账号余额并写回池（签到收尾 / 周期刷新 / 429 补跑三处共用，
+// 保证三处的「窗口口径 + 解冻语义 + 快照写入」永远一致）。
+//
+// expiringSoon 每次现取（面板热改窗口立即生效）：签到一轮 N 个号耗时数秒，跨过窗口
+// 变更时后几个号应享受新窗口，而不是全程沿用最开头取的那一份。
+// 返回错误供调用方决定日志与是否补跑（本函数不写日志、不做策略）。
+func (s *Scheduler) refreshBalanceOne(a *auth.Auth) error {
+	snap, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, s.ExpiringSoonWindow())
+	if err != nil {
+		return err
+	}
+	s.cfg.Pool.ReenableIfCredits(a.UID, snap.Remain, snap.Total)
+	s.cfg.Pool.SetCreditsDetailed(a.UID, toPoolCredits(snap))
+	return nil
+}
+
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
@@ -716,7 +737,6 @@ func (s *Scheduler) RunKeepaliveNow() {
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
-	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -729,13 +749,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			snap, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-			if err != nil {
+			if err := s.refreshBalanceOne(a); err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
-				return
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
-			s.cfg.Pool.SetCreditsDetailed(uid, toPoolCredits(snap))
 		}(a, st.UID)
 	}
 	wg.Wait()
