@@ -140,6 +140,28 @@ func TestCheckinRoundSummaryLine(t *testing.T) {
 	}
 }
 
+// 纯企业池：没有签到账号时汇总行讲「无签到账号」，而不是「签到 0 号（成功 0 …）」。
+func TestCheckinRoundSummaryEnterpriseOnly(t *testing.T) {
+	logs := captureLog(t)
+	stub := &retryStub{}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "ent", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999, EnterpriseID: "ent-1"})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunCheckinNow()
+	buf := logs()
+	if !strings.Contains(buf, "checkin 汇总: 无签到账号 · 企业号 1（不签到，只刷余额）") {
+		t.Errorf("纯企业池汇总行不符: %s", buf)
+	}
+	if n := stub.checkinCalls.Load(); n != 0 {
+		t.Errorf("企业号不应发起签到，got %d 次", n)
+	}
+}
+
 // 签到成功 + 余额失败：汇总行要同时交代两件事（余额 429 也要标出来）。
 func TestCheckinRoundSummaryIncludesBalanceFailure(t *testing.T) {
 	logs := captureLog(t)

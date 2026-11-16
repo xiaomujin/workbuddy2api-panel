@@ -567,13 +567,19 @@ type checkinRound struct {
 }
 
 // summary 生成汇总行：全零段一律不出现（不编造"0 失败"这种冗余信息）。
+// 纯企业部署（无任何签到账号）打「无签到账号」而不是「签到 0 号（成功 0 …）」。
 func (r checkinRound) summary() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "checkin 汇总: 签到 %d 号（成功 %d · 已签到 %d · 未签到 %d", r.checked, r.ok, r.already, r.failed)
-	if r.rateLimited > 0 {
-		fmt.Fprintf(&b, "，其中 429 %d 已排补跑", r.rateLimited)
+	b.WriteString("checkin 汇总: ")
+	if r.checked == 0 {
+		b.WriteString("无签到账号")
+	} else {
+		fmt.Fprintf(&b, "签到 %d 号（成功 %d · 已签到 %d · 未签到 %d", r.checked, r.ok, r.already, r.failed)
+		if r.rateLimited > 0 {
+			fmt.Fprintf(&b, "，其中 429 %d 已排补跑", r.rateLimited)
+		}
+		b.WriteString("）")
 	}
-	b.WriteString("）")
 	if r.enterprise > 0 {
 		fmt.Fprintf(&b, " · 企业号 %d（不签到，只刷余额）", r.enterprise)
 	}
