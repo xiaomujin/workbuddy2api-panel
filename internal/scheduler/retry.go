@@ -186,6 +186,11 @@ func (s *Scheduler) runRetryOne(it retryItem) {
 	if a == nil || a.RefreshTokenValue() == "" {
 		return // 账号已移除 / 无 refresh：静默丢弃（发不出任何调用）
 	}
+	// 排队期间账号被禁用：与排程口径一致（include_disabled_in_tasks 缺省跳过禁用号），
+	// 别让补跑变成绕过该开关的后门。
+	if st, ok := s.cfg.Pool.Status(it.uid); ok && st.Disabled && !s.includeDisabledInTasks() {
+		return
+	}
 	label := logfmt.Label(it.uid, a.Nickname)
 
 	switch it.op {

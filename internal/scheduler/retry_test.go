@@ -204,6 +204,27 @@ func TestScheduleRetryDedupesSameOp(t *testing.T) {
 	}
 }
 
+// TestRetrySkipsDisabledAccount 排队期间账号被禁用（且未开 include_disabled_in_tasks）
+// → 补跑跳过：补跑不是绕过该开关的后门。
+func TestRetrySkipsDisabledAccount(t *testing.T) {
+	fastRetryBackoff(t)
+	stub := &retryStub{}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+	s, p := newRetryScheduler(t, srv)
+
+	s.scheduleRetry("u1", retryCheckin, 0, 0) // 立即到期
+	p.Disable("u1", "test")
+	s.runDueRetries(context.Background())
+
+	if n := stub.checkinCalls.Load(); n != 0 {
+		t.Errorf("禁用账号不应被补跑，daily-checkin 调用 %d 次", n)
+	}
+	if n := len(s.retries); n != 0 {
+		t.Errorf("到期项应已出队，got %d", n)
+	}
+}
+
 // TestStartRetryWorkerRunsDue 后台循环按 dueAt 自动补跑，ctx 取消即停。
 func TestStartRetryWorkerRunsDue(t *testing.T) {
 	fastRetryBackoff(t)
