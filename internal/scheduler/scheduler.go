@@ -728,6 +728,17 @@ func (s *Scheduler) refreshBalanceOne(a *auth.Auth) error {
 	return nil
 }
 
+// balanceRefreshConcurrency 余额刷新并发上限。
+// balanceAccountDelay 同批内相邻两个账号的派发间隔（测试可置 0）。
+//
+// 为什么两者都要有：此前是「全并发 + 无间隔」= N 个号在同一秒打同一个只读端点，
+// 那正是 2026-11 现场 user-resource 全员 429 的形态。并发 2 让请求在时间上摊开，
+// 300ms 间隔再把发车点拉开——比 travel/activity 的 800ms 短，因为余额刷新是只读、
+// 且要在一轮（默认 5 分钟）内覆盖全部账号。
+const balanceRefreshConcurrency = 2
+
+var balanceAccountDelay = 300 * time.Millisecond
+
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
@@ -736,8 +747,10 @@ func (s *Scheduler) refreshBalanceOne(a *auth.Auth) error {
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
-	var wg sync.WaitGroup
 	includeDisabled := s.includeDisabledInTasks()
+	sem := make(chan struct{}, balanceRefreshConcurrency)
+	var wg sync.WaitGroup
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -746,9 +759,16 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if a == nil {
 			continue
 		}
+		// 派发端限速：间隔睡在派发循环里（不占工作 goroutine），并发闸门在 sem。
+		if !first {
+			time.Sleep(balanceAccountDelay)
+		}
+		first = false
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			if err := s.refreshBalanceOne(a); err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 			}
