@@ -518,6 +518,8 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 **软冷却指数退避**（与熔断器并存的第二条升级线）：软限流的**冷却时长**本身也按连续次数退避——同一账号连续触发软冷却时 `soft_rate × 2^(连续次数-1)`，封顶 `soft_rate_max`。计数 `soft_streak` 独立于熔断器的 `fails`，只在**成功**或**签到解冻**时清零，随 `state.json` 持久化。
 
+**下游 429 带 `Retry-After`**：全池冷却时返回的 `429 rate_limit_exceeded` 会附 `Retry-After: <秒>`，值取「最早再有账号能接该模型」——账号级冷却 / 熔断 / 连败降权与模型级 6004·11102 冷却的最近截止（`pool.EarliestServableIn`），再与上游明示的 `Retry-After` 头取较晚者，向上取整到秒。算不出来时**不带**该头（不编造）：例如本次只是 `max_rotate` 用完而池内其实还有健康号，此刻立刻重试才对。OpenAI 官方 SDK 会按该头自动退避。
+
 ### 选号策略
 
 1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与

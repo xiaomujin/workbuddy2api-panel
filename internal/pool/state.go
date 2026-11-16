@@ -551,6 +551,38 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	return false
 }
 
+// EarliestServableIn 估算「最早再有账号能接该 model 的请求」还要多久（now 起算）。
+// 从所有存活账号里取各自解锁时刻的最早者（disabled/paused 不参与，它们不随时间自愈）。
+// 返回值语义：
+//   - ok=false：池内没有任何可能自愈的账号（全禁用/全暂停），等待值无从谈起；
+//   - d=0：当下就有账号可服务（含"这次轮转只是撞上了已试过的号"的情形）。
+//
+// 为什么要它：全池 429 时下游只看到一句「都冷却中，稍后再试」，冷却剩余时间是本地
+// 算得出来的权威数字（上游重置墙钟 / Retry-After / soft_rate 有界退避三者之一），
+// 不告诉客户端就只能让它瞎撞。handler 据此在 429 响应上带 Retry-After 头。
+//
+// 不是选号：不做积分保底（credit_floor）与在途判定，只回答"时间上什么时候解冻"。
+// 积分保底是「不给谁用」的运营策略，不是等待时长；把它算进来会让 Retry-After
+// 变成「等到明天签到」这种误导值。
+func (p *Pool) EarliestServableIn(model string, now time.Time) (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var (
+		best time.Duration
+		ok   bool
+	)
+	for _, e := range p.byUID {
+		d, possible := e.servableIn(now, model)
+		if !possible {
+			continue
+		}
+		if !ok || d < best {
+			best, ok = d, true
+		}
+	}
+	return best, ok
+}
+
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
 func (p *Pool) List() []Status {
 	p.mu.RLock()

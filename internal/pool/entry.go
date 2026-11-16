@@ -368,6 +368,39 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	return e.healthy(now)
 }
 
+// servableIn 报告该账号「还要等多久才可能接该 model 的请求」，以及是否存在这种可能。
+// possible=false 只给 disabled / paused：这两者不随时间自愈（禁用要人工 revive、暂停
+// 是运维让位），不构成「稍后重试」的依据——把它们算进等待时长会给出一个永不兑现的
+// 承诺。其余阻塞项的语义都是「截止时刻之前不可选」，因此天然取最晚者：账号级
+// until / 熔断 / 连败降权是并列的或门（三者都过期才可选），模型级 6004/11102 冷却
+// 也必须过期才可选，所以对 model 而言的解锁时刻 = 所有这些截止的最大值。
+//
+// 只读判定：不 prune 模型级冷却表（那是 pick 写锁路径的职责），过期条目在这里
+// 自然「不阻塞」即可。在途名额不参与（瞬时状态，不是等待时长）。
+func (e *entry) servableIn(now time.Time, reqModel string) (time.Duration, bool) {
+	if e.disabled || e.paused {
+		return 0, false
+	}
+	var unlock time.Time
+	block := func(t time.Time) {
+		if !t.IsZero() && now.Before(t) && t.After(unlock) {
+			unlock = t
+		}
+	}
+	block(e.until)
+	block(e.breakerUntil)
+	block(e.degradeUntil)
+	if reqModel != "" {
+		if mc, ok := e.modelCooldowns[reqModel]; ok && !mc.AuditOnly {
+			block(mc.Until)
+		}
+	}
+	if unlock.IsZero() {
+		return 0, true
+	}
+	return unlock.Sub(now), true
+}
+
 // pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
 // pruneExpiredModelCooldowns 同形同调用点）。
 //

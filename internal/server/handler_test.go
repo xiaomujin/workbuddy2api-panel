@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -740,6 +741,59 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	}
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" || st.RateLimitedModels[0].Kind != "rate_limit" {
 		t.Fatalf("rate-limited models=%+v, want audit row for glm-5.3", st.RateLimitedModels)
+	}
+}
+
+// TestChat429SetsRetryAfter 全池软限流 → 429 带 Retry-After 头：
+// 冷却剩余时间本地算得出来（这里取注入的 soft_rate 基数），不告诉客户端它只能瞎撞。
+func TestChat429SetsRetryAfter(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, `{"error_msg":"Too Many Requests"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	const soft = 90 * time.Second
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	raw := rec.Header().Get("Retry-After")
+	secs, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("Retry-After=%q 应为整数秒: %v", raw, err)
+	}
+	if maxSec := int(soft / time.Second); secs <= 0 || secs > maxSec {
+		t.Fatalf("Retry-After=%d want (0,%d]（soft_rate 基数）", secs, maxSec)
+	}
+}
+
+// TestChat429NoRetryAfterWhenAccountStillServable 不编造等待值：只是因为 MaxRotate
+// 用完而收尾时（池里其实还有健康号），429 不带 Retry-After——此刻立刻重试才对。
+func TestChat429NoRetryAfterWhenAccountStillServable(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"error_msg":"Too Many Requests"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0) // 高分先选：确定先撞 bad
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute, MaxRotate: 1})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After=%q want 空（池内仍有健康号，等待值不成立）", got)
 	}
 }
 

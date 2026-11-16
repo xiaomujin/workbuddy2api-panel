@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -1222,6 +1223,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		status = http.StatusBadRequest
 	}
+	// 429 带上 Retry-After：冷却剩余时间本地算得出来（上游重置墙钟 / Retry-After 头 /
+	// soft_rate 有界退避三者之一），不告诉客户端就只能让它瞎撞。只在 429 上带——其余
+	// 状态码的 Retry-After 语义都不成立（503 是本地调度错误、400 model_unavailable 是
+	// "重试无意义"）。
+	if status == http.StatusTooManyRequests {
+		if secs, ok := h.retryAfterSecs(ue, bareModel); ok {
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
+	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
@@ -1495,6 +1505,26 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// retryAfterSecs 计算下游 429 响应的 Retry-After 秒数（向上取整到秒）。
+// 两个来源，取较晚者——两者都是「至少等这么久」：
+//   - 池内最早可服务时刻（Pool.EarliestServableIn）：账号冷却/熔断/连败降权/模型级
+//     6004·11102 冷却的真实截止，回答"重试多久之后真能成功"；
+//   - 上游明示的等待时长（uerr.RetryAfter）：本次失败那一跳的上游建议。
+//
+// 算不出来就返回 ok=false，调用方不带该头（不编造）：例如这次只是因为 MaxRotate
+// 用完而池内其实还有健康号（等待值=0），此时让客户端立刻重试才对，报一个数字反而
+// 把它拦在门外。
+func (h *Handler) retryAfterSecs(ue *upstream.Error, model string) (int, bool) {
+	wait, ok := h.cfg.Pool.EarliestServableIn(model, time.Now())
+	if ue != nil && ue.RetryAfter > wait {
+		wait, ok = ue.RetryAfter, true
+	}
+	if !ok || wait <= 0 {
+		return 0, false
+	}
+	return int((wait + time.Second - 1) / time.Second), true
 }
 
 // wafCooldownBase WAF 403 软冷却基数（建议 60s 起；抖动 ±25% 后落 [45s,75s]，
