@@ -225,6 +225,25 @@ const (
 	taskGrowth
 )
 
+// String 任务族的日志名（错峰取消之类的诊断行要用；未登记值回落到数字，不编造名字）。
+func (k taskKind) String() string {
+	switch k {
+	case taskCheckin:
+		return "checkin"
+	case taskTravel:
+		return "travel"
+	case taskActivity:
+		return "activity"
+	case taskKeepalive:
+		return "keepalive"
+	case taskBlackcat:
+		return "blackcat"
+	case taskGrowth:
+		return "growth"
+	}
+	return fmt.Sprintf("taskKind(%d)", int(k))
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
@@ -281,6 +300,14 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	return earliest, kinds
 }
+
+// checkinBalanceGap 签到与紧随其后的余额查询之间的间隔。
+//
+// 同一个号刚写完 POST daily-checkin，紧接着打 get-user-resource 属于「同账号连打」，
+// 上游按账号维度频控——2026-11 现场：签到成功那一秒的 user-resource 就吃 429。
+// 1s 足够让频控窗口滑过；签到一天两轮、每号一次，代价可忽略。
+// 测试可置 0（其余用例不必为它付秒级等待，见 scheduler_main_test.go）。
+var checkinBalanceGap = time.Second
 
 // wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
 // 网络栈/DNS 1-2s 才恢复（issue #152 实测 dial tcp lookup no such host 与
@@ -392,37 +419,87 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
-// ctx 取消时由各任务内部的可取消等待快速收尾。
+// taskStagger 同一唤醒槽内多任务族的错峰偏移（任务族 → 相对槽位起点的延迟）。
+//
+// 为什么必须错峰：整点同时派发会让**同一个号**在几秒内被签到（daily-checkin）、旅行
+// （buddy/travel）连打——上游按账号维度频控，这种"自撞"是任务侧 429 的主因（2026-11
+// 现场：09:00:01 checkin 429 → 同秒 user-resource 429 → 09:00:03 travel claim ok，
+// 同一账号 3 秒内 3 种计费调用），而 checkin_hours 与 travel_hours 默认都是 [9,21]，
+// 同槽是常态而非巧合。
+//
+// 为什么是固定偏移而不是"上一族跑完再下一族"：慢族（活跃上报 N 号 × 800ms）会把同槽
+// 其他族推迟到不可预测的时刻；固定偏移让每族的实际起点可预测、可测试。偏移只在同一
+// 槽内叠加，跨槽不累积（下一槽仍从整点起算）。
+//
+// 测试置 0（scheduler_main_test.go）：节奏由各自的专用用例显式设置并断言。
+var taskStagger = []taskStaggerEntry{
+	{taskCheckin, 0},
+	{taskTravel, 45 * time.Second},
+	{taskActivity, 90 * time.Second},
+	{taskKeepalive, 135 * time.Second},
+	{taskBlackcat, 180 * time.Second},
+	{taskGrowth, 225 * time.Second},
+}
+
+// taskStaggerEntry 单条错峰配置。
+type taskStaggerEntry struct {
+	kind  taskKind
+	delay time.Duration
+}
+
+// staggerOf 返回某任务族的错峰偏移；未登记 = 0（立刻执行）。
+func staggerOf(k taskKind) time.Duration {
+	for _, e := range taskStagger {
+		if e.kind == k {
+			return e.delay
+		}
+	}
+	return 0
+}
+
+// runBatch 派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// 每类一个 goroutine，各自按 staggerOf 错峰起跑后再执行任务体：慢族不再阻塞
+// 同槽其他族，同时保证同槽的任务族不会在同一秒内对同一批账号连打（见 taskStagger）。
+// ctx 取消时：尚在错峰等待的族直接放弃（下槽重来，排程本身不丢），已在执行的族由
+// 各自的 ctx 感知逻辑收尾。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 	var wg sync.WaitGroup
 	for _, k := range kinds {
 		wg.Add(1)
 		go func(k taskKind) {
 			defer wg.Done()
-			switch k {
-			case taskCheckin:
-				s.RunCheckinNow()
-			case taskTravel:
-				s.RunTravelNow()
-			case taskActivity:
-				s.runActivity(ctx)
-			case taskKeepalive:
-				s.RunKeepaliveNow()
-			case taskBlackcat:
-				s.RunBlackcatNow()
-			case taskGrowth:
-				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
-				s.schedMu.Lock()
-				hook := s.cfg.GrowthHook
-				s.schedMu.Unlock()
-				if hook != nil {
-					hook()
-				}
+			if d := staggerOf(k); d > 0 && !sleepCtx(ctx, d) {
+				log.Printf("scheduler: %s 错峰等待被取消（停机），本槽跳过本族", k)
+				return
 			}
+			s.runTask(ctx, k)
 		}(k)
 	}
 	wg.Wait()
+}
+
+// runTask 执行单个任务族（runBatch 在错峰之后调用；测试亦可直接驱动）。
+func (s *Scheduler) runTask(ctx context.Context, k taskKind) {
+	switch k {
+	case taskCheckin:
+		s.RunCheckinNow()
+	case taskTravel:
+		s.RunTravelNow()
+	case taskActivity:
+		s.runActivity(ctx)
+	case taskKeepalive:
+		s.RunKeepaliveNow()
+	case taskBlackcat:
+		s.RunBlackcatNow()
+	case taskGrowth:
+		// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
+		s.schedMu.Lock()
+		hook := s.cfg.GrowthHook
+		s.schedMu.Unlock()
+		if hook != nil {
+			hook()
+		}
+	}
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -502,6 +579,12 @@ func (s *Scheduler) RunCheckinNow() {
 				// 重复触发时出现），成功也落一行。
 				s.cfg.Pool.NoteCheckinDone(st.UID)
 				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+			}
+			// 签到后留一点间隔再查余额：同一个号刚写完 daily-checkin 紧接着查余额属于
+			// 「同账号连打」，上游按账号维度频控（见 checkinBalanceGap）。企业号不签到，
+			// 不会走到这里。
+			if checkinBalanceGap > 0 {
+				time.Sleep(checkinBalanceGap)
 			}
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次
