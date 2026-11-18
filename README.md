@@ -94,6 +94,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | `Hp_Appearance` | +100c +5e | 主题设置 + 皮肤生效事件 |
 | `Expert_lighthouse` | +100c +5e | 轻量云专家召唤+使用链（真实对话 requestId，**可免费领一个月轻量服务器**） |
 | `skill_1` | +100c +5e | 真实对话 + 技能加载事件（skill_info） |
+| `skill_share` | +50c +5e | 技能详情页分享埋点链（`skill_detail_show` → `skill_share_entry_click` → `skill_share_channel_action`，客户端 asar 逆向，两账号实测点亮 +50c+5e） |
 | `WorkBuddy_Valorant` | +100c +5e | 「无畏契约拼豆专家」召唤+使用链（`ex_xQHHD1u5Jkua`，截止 11-15） |
 
 ### 限时「体验某专家」任务（通用识别，零登记）

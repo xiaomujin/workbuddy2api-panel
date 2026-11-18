@@ -129,6 +129,11 @@ var autoActions = []autoAction{
 		run:      runSkillFresh,
 	},
 	{
+		TaskCode: "skill_share",
+		Desc:     "技能详情页分享埋点链（客户端 asar 逆向口径，待实测）",
+		run:      runSkillShare,
+	},
+	{
 		TaskCode: "Expert_lighthouse",
 		Desc:     "真实轻量云专家召唤+使用链（chat 链带 has_expert，已验证：两账号点亮）",
 		run:      runExpertLighthouse,
@@ -949,10 +954,57 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 	return "已上报真实对话 + skill_info 技能加载事件", nil
 }
 
+// skillShareSkill 分享判据里携带的技能（技能市场真实条目）。
+// skillId 取自实测样本（skill_1 的 skill_info 同源），服务端按真实技能 id 归账；
+// 上游若下线该技能，只需换一个市场里的真实 skill_xxx。
+var (
+	skillShareSkillID      = "skill_2097350077599879168"
+	skillShareSkillName    = "润泽小馆·日报撰写"
+	skillShareSkillVersion = "1.0.0"
+)
+
+// runSkillShare 完成 skill_share「分享一个技能给好友」（+50c+5e）。
+//
+// 判据（2026-11-18 客户端 asar 逆向，见 upstream.DesktopSkillShareSequence）：
+// 技能详情页的分享埋点链 skill_detail_show → skill_share_entry_click →
+// skill_share_security_result(source=local_skip) → skill_share_channel_action
+// (panelAction=click/success)。客户端不做任务码映射，判据全在服务端埋点侧，
+// 故纯 API 可复刻（与 skill_1 的 skill_info 同机制）。
+//
+// 任务描述要求电脑端 ≥5.9.0——全局桌面指纹已统一升到真机 5.11.3
+// （upstream.desktopClientVersion），本任务与其他桌面任务共用同一版本口径。
+//
+// 若服务端校验 skill_share_channel_action.id（真实分享通道 shareCode），则需先
+// 建一条真实通道：POST {openPlatformOrigin}/api/v2/open-platform/asset-shares/c2c/
+// channels {assetSource:"builtin-market",assetRef:{assetId},ways:["link","wxacode",
+// "wxapath"],extra:{…}} → 把返回的 channelId 填进 id 再上报。当前未启用（先用最
+// 小成本形态验证判据），失败即由 autoAction.Attempt 语义收敛，不反复烧配额。
+func runSkillShare(p *Panel, a *auth.Auth) (string, error) {
+	const code = "skill_share"
+	t, err := p.taskByCode(a, code)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "上游未下发该任务（活动可能已结束）", nil
+	}
+	if t.Claimed {
+		return "已领取", nil
+	}
+	// accept 前置：not_accepted 时上游 target=0，行为事件一律不归账（本项目多次实测）。
+	if err := p.acceptExpertTask(a, code); err != nil {
+		return "", err
+	}
+	events := upstream.DesktopSkillShareSequence(skillShareSkillID, skillShareSkillName, skillShareSkillVersion)
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("分享埋点上报: %w", err)
+	}
+	return fmt.Sprintf("已上报技能「%s」详情页分享埋点链（detail_show→entry_click→channel_action）", skillShareSkillName), nil
+}
+
 // ---------------------------------------------------------------------------
 // 体验「X」专家类任务（通用）
 // ---------------------------------------------------------------------------
-
 // expertIDPattern 从任务 jump_url 里抽专家 id。两种真实形态都要认
 // （任务中心下发的是第二种，deeplink 被百分号编码）：
 //

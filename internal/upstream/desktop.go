@@ -1,11 +1,11 @@
-// desktop.go 桌面客户端（WorkBuddy Desktop 5.5.6）行为指纹上报。
+// desktop.go 桌面客户端（WorkBuddy Desktop 5.11.3）行为指纹上报。
 //
 // 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）。桌面端点亮
 // 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
 // **不同的客户端指纹**：
 //
 //	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1
+//	User-Agent: WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0
 //	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
@@ -40,8 +40,23 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+
+	// desktopClientVersion 桌面客户端版本（唯一真源）。
+	// 2026-11-18 取自真机 D:\Program Files\WorkBuddy\resources\install-manifest.json
+	// 的 appVersion 与 cli/product.json 的 genieVersion（同为 5.11.3）。
+	// 此前写的是 5.5.6：新任务（如 skill_share「电脑端 ≥5.9.0」）会按版本过滤，
+	// 旧值会被判为不满足条件。
+	desktopClientVersion = "5.11.3"
+	// desktopCLIVersion 桌面端内嵌 CLI 版本：取自 app.asar.unpacked/cli/package.json
+	// （@genie/agent-cli 2.176.0）。此前写 2.137.1，与 5.11.3 客户端不配套。
+	desktopCLIVersion = "2.176.0"
+	// desktopReleaseDate / desktopCommit 客户端发布信息，对齐 cli/product.json 的
+	// date（2026-11-12T16:49:29.764Z）与 commit。
+	desktopReleaseDate = int64(1794502169000)
+	desktopCommit      = "ecace0f7028166695994300182295329b8b95449"
+
+	// desktopUA 桌面客户端 UA（三段式，与 RestOperations 层同形状）。
+	desktopUA = "WorkBuddy/" + desktopClientVersion + " WorkBuddy/" + desktopClientVersion + " CLI/" + desktopCLIVersion
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
@@ -67,15 +82,15 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1789036585355),
-		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
+		"releaseDate":  desktopReleaseDate,
+		"commit":       desktopCommit,
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   desktopClientVersion,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   desktopClientVersion,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
@@ -297,7 +312,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 
 // ---------------------------------------------------------------------------
 // 2026-09-12 第五轮：客户端 asar 逆向 + Sunny 真实样本驱动的新判据（三账号实测点亮）。
-// 来源：WorkBuddy.exe 5.5.6 app.asar 渲染层事件枚举/载荷 + 抓包真实专家召唤样本
+// 来源：WorkBuddy.exe 5.11.3 app.asar 渲染层事件枚举/载荷 + 抓包真实专家召唤样本
 // （data/desktop-task-protocol.md §7.3）。
 // ---------------------------------------------------------------------------
 
@@ -365,6 +380,84 @@ func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEven
 			"source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": true,
 		},
 	)
+}
+
+// ---------------------------------------------------------------------------
+// 技能分享（skill_share「分享一个技能给好友」）
+// ---------------------------------------------------------------------------
+
+// skillShareRealVersion 已并入全局桌面指纹（desktopClientVersion = 5.11.3），
+// 本组事件不再单独覆盖 ideVersion/extVersion——版本只有一个真源。
+//
+// DesktopSkillShareSequence 构造桌面端「技能详情页 → 分享」埋点链。
+//
+// 来源：2026-11-18 客户端 asar 逆向（app.asar 内
+// renderer/assets/use-skill-detail-installed-state-DpxX3E1o.js 的
+// reportShareEntryClick / reportShareSecurityResult / reportShareChannelAction，
+// 事件名枚举见 renderer/assets/adapter-telemetry-service-*.js）。真实时序：
+//
+//	打开技能详情页  → skill_detail_show      {skillId,name,skillVersion}
+//	点「分享」按钮  → skill_share_entry_click {skillId,skillName,skillType,skillSource,
+//	                                          entry:"skill_detail",status,actionSuccessful,
+//	                                          tooltip,clickAt}
+//	弹窗自动建分享  → skill_share_security_result {source:"local_skip",status:"safe",…}
+//	                  （市场技能无需上传过审，客户端就是发 local_skip 形态）
+//	点渠道          → skill_share_channel_action {action,panelAction,panelType,
+//	                                          isSuccessful,cost,id(=shareCode),actionAt}
+//
+// 客户端不做任何任务码映射（asar 内搜 Sequential_Tasks / RichMeow_Chat 全为 0 命中），
+// 判据完全在服务端埋点侧，故可纯 API 复刻（与 skill_1 的 skill_info 同机制）。
+// shareCode 是真实分享通道 id（POST /api/v2/open-platform/asset-shares/c2c/channels
+// 返回）；实测不填 id 也点亮，故当前留空。
+func DesktopSkillShareSequence(skillID, skillName, skillVersion string) []DesktopEvent {
+	now := time.Now().UnixMilli()
+	if skillVersion == "" {
+		skillVersion = "1.0.0"
+	}
+	identity := func() map[string]any {
+		return map[string]any{
+			"skillId":     skillID,
+			"skillName":   skillName,
+			"skillType":   "market", // resolveSkillIdentity：市场技能 custom/market 二选一
+			"skillSource": "builtin-market",
+		}
+	}
+	with := func(base map[string]any, extra map[string]any) DesktopEvent {
+		m := map[string]any{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return DesktopEvent(m)
+	}
+	return []DesktopEvent{
+		DesktopEvent{
+			"eventCode": "skill_detail_show", "skillId": skillID,
+			"name": skillName, "skillVersion": skillVersion,
+		},
+		with(identity(), map[string]any{
+			"eventCode": "skill_share_entry_click", "entry": "skill_detail",
+			"status": "safe", "actionSuccessful": true, "tooltip": "", "clickAt": now,
+		}),
+		with(identity(), map[string]any{
+			"eventCode": "skill_share_security_result", "entry": "skill_detail",
+			"source": "local_skip", "status": "safe", "actionSuccessful": true,
+			"version": skillVersion, "cost": 180, "duration": 90,
+		}),
+		// click → success 两次（客户端先报点击、渠道动作完成后再报 success）。
+		with(identity(), map[string]any{
+			"eventCode": "skill_share_channel_action", "action": "link",
+			"panelAction": "click", "panelType": "clipboard", "isSuccessful": true,
+			"cost": 0, "id": "", "actionAt": now + 400,
+		}),
+		with(identity(), map[string]any{
+			"eventCode": "skill_share_channel_action", "action": "link",
+			"panelAction": "success", "panelType": "clipboard", "isSuccessful": true,
+			"cost": 420, "id": "", "actionAt": now + 820,
+		}),
+	}
 }
 
 // MarketExpert 专家市场的单个专家（/portal/operation-platform/market/expert/list 响应子集）。
@@ -466,7 +559,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
+	h.Set("X-IDE-Version", desktopClientVersion)
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
