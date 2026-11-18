@@ -75,6 +75,10 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// Repair 11-128 保真修复阶梯配置（缺省值见 defaultRepair*；零值 = 关闭阶梯，
+	// 退回"一次 400 直接降级"的老行为）。
+	Repair repairConfig
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -116,6 +120,9 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// repair 11-128 保真修复阶梯（L0 结构归位 / L2 拆句 / L3 搬家 / L4 局部降级）
+	// 与段指纹记忆。repair.enabled=false 时退化为旧的一次性降级行为。
+	repair *repairLadder
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
@@ -136,6 +143,17 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 降级粒度：按 (realm, seg) 桶 + 短 TTL（缺省 30m），并允许 realm 级兜底。
+	ttl := cfg.Repair.DegradeTTL
+	if ttl == 0 {
+		// 零值 = 未配置 → 用缺省 30m（"锁到次日"的老行为要显式配 degrade_ttl:"day"）。
+		ttl = defaultDegradeTTL
+	}
+	if ttl < 0 {
+		ttl = 0 // 负值 = 显式要求"到次日 00:00"的老语义
+	}
+	h.degrade.configure(ttl, cfg.Repair.FallbackTTL, cfg.Repair.FallbackThreshold)
+	h.repair = newRepair(cfg.Repair)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -224,6 +242,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if degradeActive {
 		degradeUntilAny = degradeUntil
 	}
+	// 逐作用域明细：为空时写 null（面板按"有没有数组"决定是否显示提示条）。
+	var scopesAny any
+	if scopes := h.degrade.Scopes(); len(scopes) > 0 {
+		scopesAny = scopes
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
@@ -256,7 +279,82 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 未降级时 active=false、until=null）。零回归：只增键。
 		"degrade_active": degradeActive,
 		"degrade_until":  degradeUntilAny,
+		// degrade_scopes 逐个作用域（realm + 段指纹 + 到期时刻）。旧实现只有一个
+		// 进程级 until，看不出"是谁在降级、影响多大"；分段后运维能直接定位到
+		// 具体客户端的 system 指纹段。零回归：只增键。
+		"degrade_scopes": scopesAny,
+		// repair_active 修复阶梯是否启用（面板据此决定是否显示灌库入口）。
+		"repair_active": h.repair.Enabled(),
 	})
+}
+
+// DegradeScopes 返回当前全部降级作用域（供面板 /overview 展示）。
+func (h *Handler) DegradeScopes() []DegradeScope { return h.degrade.Scopes() }
+
+// DegradeClear 清除降级作用域（realm 为空 = 全清；seg 为空 = 清该 realm 全部）。
+// 返回清除条数。面板「一键恢复」用：降级是猜测性的，人工确认上游已放行后应当能立刻复位，
+// 而不是只能重启进程。
+func (h *Handler) DegradeClear(realm, seg string) int { return h.degrade.Clear(realm, seg) }
+
+// RepairMemory 返回段指纹记忆表（未启用时为 nil）。
+func (h *Handler) RepairMemory() *repairMemory { return h.repair.Memory() }
+
+// DegradeScopesView 降级作用域的展示形态（面板直接渲染，不暴露内部类型）。
+func (h *Handler) DegradeScopesView() []map[string]any {
+	scopes := h.degrade.Scopes()
+	out := make([]map[string]any, 0, len(scopes))
+	for _, s := range scopes {
+		out = append(out, map[string]any{
+			"realm": s.Realm,
+			"seg":   s.Seg,
+			"until": s.Until,
+			// 空的 seg = 该 realm 的全局兜底（多段连续失败后被整体降级）。
+			"realm_wide": s.Seg == "",
+		})
+	}
+	return out
+}
+
+// RepairMemoryView 段指纹记忆的展示形态（按最近命中倒序）。
+func (h *Handler) RepairMemoryView() []map[string]any {
+	mem := h.repair.Memory()
+	if mem == nil {
+		return nil
+	}
+	entries := mem.Snapshot()
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, map[string]any{
+			"realm":  e.Realm,
+			"seg":    e.Seg,
+			"model":  e.Model,
+			"level":  e.Level,
+			"hits":   e.Hits,
+			"source": e.Source,
+			"note":   e.Note,
+			"first":  e.First,
+			"last":   e.Last,
+		})
+	}
+	return out
+}
+
+// RepairMemoryAdd 人工灌库（面板）。(realm, seg) 固定到某一级。
+func (h *Handler) RepairMemoryAdd(realm, seg, model, note string, level int) error {
+	mem := h.repair.Memory()
+	if mem == nil {
+		return errRepairMemoryDisabled
+	}
+	return mem.UpsertManual(realm, seg, model, note, repairLevel(level))
+}
+
+// RepairMemoryRemove 删除一条记忆（面板）。
+func (h *Handler) RepairMemoryRemove(realm, seg string) error {
+	mem := h.repair.Memory()
+	if mem == nil {
+		return errRepairMemoryDisabled
+	}
+	return mem.Remove(realm, seg)
 }
 
 // DegradeSnapshot 暴露只读降级状态（供面板 /overview 展示）。
@@ -704,12 +802,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
+	// L0 结构归位：首条必须是 system（上游渠道校验的硬要求——首条是 user 回
+	// 11-128 "first message is not system prompt"，首条是 developer 回
+	// "Illegal API invocation from an unapproved channel"，与内容拦截文案相同，
+	// 极易误判）。custom/append 本来就以网关 system 开头，此步是 no-op。
+	if h.repair.EnsureSystemFirst() {
+		body = prompt.EnsureSystemFirst(body, prompt.Degraded)
+	}
+
+	// 段指纹：**客户端原始 system 文本**的 hash，在任何网关改写之前算。
+	// 降级桶与记忆表都以它为 key——同一客户端无论当前是否被 append/replace，
+	// 都落在同一个桶里，不会因为模式变化让历史记忆全部失配。
+	seg := prompt.SystemDigest(body)
+
+	// 局部降级检查：命中 (realm, seg) 桶时直达中性提示词，不再先撞一次 400。
+	// 这是旧实现「整站到次日 00:00」的替代：只有带同一段的请求受影响。
+	degraded := (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") &&
+		h.degrade.Active(realm, seg)
+
 	degradedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !degraded {
 		body = prompt.Append(body, h.cfg.PromptText)
-	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
+	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && degraded {
+		// append 在降级期退化为 replace：带指纹原文重试只会确定性再撞墙。
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
@@ -718,6 +835,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
 	if bareModel != peek.Model {
 		body = rewriteModel(body, bareModel)
+	}
+
+	// 修复阶梯的请求级状态：base = 最终出站体的深拷贝（阶梯每级都从它派生，
+	// 不在上一次结果上叠加——累积式变换互相污染，出问题极难定位）。
+	rs := h.repair.NewStateWithSeg(body, realm, bareModel, seg)
+	if degradedApplied {
+		rs.MarkDegraded()
+	} else if nb, lvl, ok := h.repair.Preapply(rs, realm); ok {
+		// 段指纹记忆命中：这一段上次被某一级救回来过 → 首次出站就用该级形态，
+		// 省掉一次必然的 400 往返（延迟与风控暴露都白付）。
+		body = nb
+		st.repairLevel = int(lvl)
+		st.repairSeg = rs.Seg()
 	}
 
 	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
@@ -757,7 +887,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 循环预算 = 换号次数 + 修复次数。阶梯的每次重发都要一次上游调用，若与
+	// MaxRotate 共用预算，默认 3 次会在 L2/L3 就被吃光、永远走不到 L4。
+	maxIter := h.cfg.MaxRotate + h.repair.Budget()
+	if maxIter < h.cfg.MaxRotate {
+		maxIter = h.cfg.MaxRotate
+	}
+	for i := 0; i < maxIter; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -880,24 +1016,66 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
-			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
-			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
-			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
+			// 内容拦截误报（passthrough/append 模式）：走**保真修复阶梯**，从轻到重：
+			//   L2 拆句（断连续原文，一字不改、通道仍是 system）
+			//   L3 搬家（system → 首条 user，一字不改）
+			//   L4 局部降级（(realm,seg) 桶 + 短 TTL 换中性提示词）
+			//
+			// 每一级成功后写段指纹记忆：同一段第二次出现时直接从记忆级别起步，
+			// 不再先撞一次 400（省一次往返，也省一次风控暴露）。
+			// 全部用尽 → 记一次 realm 级失败（达到阈值触发 realm 全局兜底），
+			// 并把这个请求交回内容防火墙分支（用户内容本身触发审核时确实无解）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
-				h.degrade.Trigger()
-				body = prompt.Rewrite(body, prompt.Degraded)
-				degradedApplied = true
-				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
-				releaseHeld()
-				// 降级是**静默换掉出站提示词**，必须留下能定位的现场：哪个域、哪个模型、
-				// 哪个号、第几次尝试、换到什么时候。没有这行时只能从「模型变笨了」倒推。
-				_, degradeUntil := h.degrade.Snapshot()
-				log.Printf("WARN: [degrade] content-blocked (likely system-prompt fingerprint false positive) -> serving degraded prompt until %s (realm=%q model=%q acct=%s attempt=%d)",
-					degradeUntil.Format(time.RFC3339), realm, bareModel,
-					logfmt.Label(acct.UID, acct.Nickname), i+1)
-				continue
+				if h.repair.Enabled() {
+					if nb, lvl, ok := h.repair.Next(rs, realm); ok {
+						body = nb
+						delete(tried, acct.UID) // 单账号池也能拿到重试机会（阶梯占一次名额）
+						releaseHeld()
+						st.repairLevel = int(lvl)
+						st.repairSeg = rs.Seg()
+						if lvl == repairNeutral {
+							h.degrade.Trigger(realm, rs.Seg())
+							_, degradeUntil := h.degrade.Snapshot()
+							log.Printf("WARN: [degrade] content-blocked -> scoped neutral prompt until %s (realm=%q seg=%s model=%q acct=%s attempt=%d)",
+								degradeUntil.Format(time.RFC3339), realm, rs.Seg(), bareModel,
+								logfmt.Label(acct.UID, acct.Nickname), i+1)
+						} else {
+							// 结构级修复是"一字不改"的，但仍必须留现场：改了什么、
+							// 哪一段、哪个号，否则「模型行为微变」只能靠猜。
+							log.Printf("WARN: [repair] content-blocked -> level=%s (realm=%q seg=%s model=%q acct=%s attempt=%d)",
+								lvl, realm, rs.Seg(), bareModel,
+								logfmt.Label(acct.UID, acct.Nickname), i+1)
+						}
+						continue
+					}
+					// 阶梯用尽：记 realm 级失败，跨过阈值就把整个 realm 兜底降级
+					// （避免上游按 realm 封语义时，每个请求都白跑 4 次上游调用）。
+					// 同时落一份现场（只含 system 文本与角色序列，不含用户内容）：
+					// 这是"人工灌库"工作流的输入——离线二分定位触发段后写回记忆表。
+					if path := h.repair.Dump(rs, realm, bareModel, "ladder_exhausted"); path != "" {
+						log.Printf("WARN: [repair] ladder exhausted, dumped blocked request -> %s (realm=%q seg=%s model=%q)", path, realm, rs.Seg(), bareModel)
+					}
+					if h.degrade.NoteFailure(realm, rs.Seg()) {
+						_, degradeUntil := h.degrade.Snapshot()
+						log.Printf("WARN: [degrade] realm-wide fallback: %d+ distinct segments failed the whole repair ladder -> realm=%q degraded until %s",
+							h.repair.cfg.FallbackThreshold, realm, degradeUntil.Format(time.RFC3339))
+					}
+				} else {
+					// 逃生门（repair.enabled=false）：逐字保留旧行为——一次 400 即降级，
+					// 换中性提示词同请求内重试一次。注意这里触发的是**全局桶**（seg 为空），
+					// 与旧实现的进程级单例语义对齐。
+					h.degrade.Trigger(realm, "")
+					body = prompt.Rewrite(rs.base, prompt.Degraded)
+					degradedApplied = true
+					delete(tried, acct.UID)
+					releaseHeld()
+					_, degradeUntil := h.degrade.Snapshot()
+					log.Printf("WARN: [degrade] content-blocked (likely system-prompt fingerprint false positive) -> serving degraded prompt until %s (realm=%q model=%q acct=%s attempt=%d)",
+						degradeUntil.Format(time.RFC3339), realm, bareModel,
+						logfmt.Label(acct.UID, acct.Nickname), i+1)
+					continue
+				}
 			}
 			if kind == upstream.ErrContentBlocked {
 				// 内容命中网关内容防火墙：立即回客户端，**不轮转**——换任何账号都会撞同一
@@ -997,6 +1175,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
 		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
 		// 记成健康、粘性把会话钉死在它身上，后续每一轮都打同一个限流号。
+		// 本次请求是被修复阶梯救回来的（L2/L3/L4）→ 记住「这一段在这级有效」，
+		// 同一段的后续请求直接从该级起步，不必再先撞一次 400。
+		if rs.Level() != repairNone {
+			h.repair.Remember(rs, realm, rs.Level())
+		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK

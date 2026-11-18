@@ -405,6 +405,13 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
+| `repair.enabled` | `true` | 11-128 修复阶梯总开关；`false` = 退回「一次 400 → 全局降级 → 中性提示词重试一次」的旧行为 |
+| `repair.ensure_system_first` / `repair.split_system` / `repair.move_system_to_user` | `true` | L0 首条补 system / L2 拆句 / L3 搬家，逐级开关 |
+| `repair.budget` | `3` | 每请求允许为修复额外消耗的上游调用次数（附加在 `max_rotate` 之外，不挤占换号预算） |
+| `repair.degrade_ttl` | `30m` | L4 局部降级 TTL（钳 `[5m, 24h]`）；`"day"` = 到次日 00:00 CST 的旧语义 |
+| `repair.global_fallback_ttl` / `repair.global_fallback_threshold` | `30m` / `3` | 15 分钟内 ≥N 个不同段全阶梯失败 → 该 realm 整体降级；`0` = 关闭兜底 |
+| `repair.memory.enabled` / `.path` / `.preapply_after` | `true` / 空 / `2` | 段指纹记忆（落 `data/repair-memory.json`）；同一段命中 N 次后预置该级。空路径 = 与 state 文件同目录 |
+| `repair.dump_dir` | `dump` | 全阶梯失败的现场落盘目录（相对 state 目录）。只写 system 文本与角色序列，不含 user/assistant 内容；同一段只写一份、上限 200 段；空 = 关闭 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
@@ -456,13 +463,27 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制）。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
 
-### 内容拦截误报与降级重试
+### 内容拦截误报与修复阶梯（11-128）
 
-`passthrough` 模式请求被上游内容策略拦截（HTTP 400 + `blocked by security policy` / `unapproved channel` / `illegal api invocation` 文案）时，判定为 system 指纹误报：**同请求内**换 Degraded 中性提示词重试一次；第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端，并如实报给调用方。
+`passthrough` / `append` 模式请求被上游内容策略拦截（HTTP 400 + `blocked by security policy` / `unapproved channel` / `illegal api invocation` 文案）时，判定为 system 指纹误报：**同请求内**按「语义损失从小到大」逐级抢救，前一级成功就不再进下一级。
 
-- 触发降级后持续到**次日 00:00 CST**（Asia/Shanghai）重置；降级期内 `passthrough` 请求直达中性提示词，不再先撞 400
-- 降级状态是**进程内存态**，重启清零
-- 内容问题非账号问题：`ErrContentBlocked` 不罚账号（无冷却 / 熔断 / 计错），由网关降级重试消化
+| 级别 | 动作 | 丢不丢东西 | 说明 |
+|---|---|---|---|
+| L0 | `EnsureSystemFirst` | 不丢 | 首条必须是 `system`（`developer` 就地归一）。上游渠道校验的硬要求：首条是 `user` 回 `first message is not system prompt`、首条是 `developer` 回 `Illegal API invocation from an unapproved channel`——与内容拦截同一句文案，极易误判 |
+| L1 | 指纹脱敏（`sanitize`） | 同义改写 | 始终生效，不算重试级。含 DSH `@ 路径说明段` 整段改写、`You are … powered by …` 句式、`tools[].function.description`、上游注入身份指令回流（`<model_identity>`） |
+| L2 | `SplitSystemMessages` | **一字不改** | 把最长那条 system 按句界拆成多条 system。上游按「连续原文」匹配，句界一断即失配，通道仍是 system（指令优先级不变） |
+| L3 | `MoveSystemToUser` | **一字不改** | 把 system 原文搬进首条 user、system 换中性句。拆不动才用（例如只剩一句） |
+| L4 | 中性提示词 | 丢客户端 prompt | 局部降级：只影响同一 `(realm, 段指纹)` 桶的请求，默认 30 分钟后自动恢复 |
+
+- **降级作用域**：`(realm, system 文本指纹)` 为桶，不再是进程级单例——一个客户端的指纹不会污染全站；面板显示「N 段 / 全域兜底 / 至几时」，可一键恢复（`POST /panel/api/degrade/clear`），不必重启
+- **realm 全局兜底**：15 分钟内 ≥3 个**不同段**都走完全阶梯仍失败 → 该 realm 整体降级 30 分钟（避免上游按 realm 封语义时每个请求都白跑 4 次上游调用）
+- **段指纹记忆**（`data/repair-memory.json`）：某一段在某级救回来成功后自动入库；同一段第二次命中即从该级起步，省掉一次必然的 400。可人工灌库（`POST /panel/api/repair/memory`），也可只删条目
+- **现场落盘**（`repair.dump_dir`，默认 `dump`，相对 state 目录）：全阶梯失败时落一份**只含 system 文本与角色序列**的诊断 JSON（不写 user / assistant 内容；同一段只写一份、上限 200 段），喂 `go run internal/probe/probe_repair.go -dump …` 做离线二分，测出「最少几句连排才被拦」并给出建议级别
+- 内容问题非账号问题：`ErrContentBlocked` 不罚账号（无冷却 / 熔断 / 计错）
+- `repair.enabled=false` 可整体退回旧行为（一次 400 → 全局降级 → 中性提示词重试一次）
+
+> 设计依据（真机实测）：上游对这类指纹按**连续原文**匹配而非语义审核——整段放 system → 400；按句界拆成多条 system → 200；每句一条 → 200；同义改写 → 200；原文搬进 user → 200。同一 body 换账号结果一致，所以轮转无用、也不该罚号。
+
 
 ### 原生工具调用标记还原
 
@@ -935,7 +956,18 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 ### 系统提示词被内容策略误杀怎么办？
 
-默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
+默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。
+
+`passthrough` / `append` 模式（要保真客户端 system）下，撞拦截后走[修复阶梯](#内容拦截误报与修复阶梯11-128)：**先拆句（一字不改）→ 再搬家（一字不改）→ 最后才是局部降级**。降级只影响同一 `(realm, 段指纹)`，默认 30 分钟自动恢复，面板可一键清除。
+
+排查顺序：
+
+1. 面板顶部「提示词降级中（N 段）」→ 点「恢复」先复位，看是否复发；
+2. `/status` 的 `degrade_scopes` 看是哪一段（`seg` 是 system 文本 hash 前 8 位）；
+3. 想定位到具体句子：`repair.dump_dir`（默认 `dump`，只记 system 文本）里就有现成样本，跑
+   `go run internal/probe/probe_repair.go -dump data/dump/<file>.json -auths ./auths`；
+4. 测出级别后用 `POST /panel/api/repair/memory`（或手改 `data/repair-memory.json`）灌库，`{realm, seg, level}`，之后该段直接按该级出站。
+
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
@@ -952,7 +984,12 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
 | `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:54` |
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
-| 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
+| 修复阶梯 L0/L2/L3（补 system / 拆句 / 搬家） | `internal/prompt/repair.go`（`EnsureSystemFirst` / `SplitSystemMessages` / `MoveSystemToUser`）、首条角色快路径 `internal/prompt/scan.go` |
+| 阶梯状态机与段指纹记忆 | `internal/server/repair.go`（`repairLadder.Next` / `Preapply` / `Remember`）、落盘 `internal/server/repair_dump.go` |
+| 降级作用域 `(realm, seg)` + 短 TTL + realm 兜底 | `internal/server/degrade.go`（`Trigger` / `Scopes` / `Clear` / `NoteFailure`） |
+| 11-128 阶梯接线与 `/status.degrade_scopes` | `internal/server/handler.go`（chatCompletions 内容拦截分支、status） |
+| 面板降级明细 / 一键恢复 / 灌库接口 | `internal/panel/repair.go` |
+| 离线二分诊断工具 | `internal/probe/probe_repair.go`（`//go:build ignore`） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
 | 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |

@@ -84,6 +84,11 @@ type Event struct {
 	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
 	ClientIP        string `json:"client_ip,omitempty"`
 	UserAgent       string `json:"user_agent,omitempty"`
+	// RepairLevel / RepairSeg 本次请求被 11-128 修复阶梯救回来的级别与段指纹。
+	// 0 = 没做过结构级修复。**只记级别与 8 位指纹，不记任何提示词原文**——它回答的是
+	// 「这一行为什么和平时不一样」，不是「用户说了什么」。
+	RepairLevel int    `json:"repair_level,omitempty"`
+	RepairSeg   string `json:"repair_seg,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

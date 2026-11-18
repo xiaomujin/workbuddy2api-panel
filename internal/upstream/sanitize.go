@@ -172,9 +172,13 @@ const (
 	maskIdentity                          // 自我介绍句式
 	maskGui                               // GUI 描述段
 	maskBrand                             // 品牌缩减
+	maskPaths                             // DSH「@ 路径说明段」整段改写（不分角色，见 sanitizeDshPathsRe）
 )
 
 // 句式层三条规则的位：identity=false（user/tool 数据）时整体清掉。
+//
+// maskPaths **不在**这里：上游对那段说明是按连续原文匹配、**不分角色**，放进 user
+// 里同样 400（sanitizeDshPathsRe 的注释有实测依据），所以它必须在所有角色上生效。
 const maskSentenceLayer = maskIdentity | maskGui | maskBrand
 
 // 折叠探针（全小写）。每条都必须是**对应规则匹配文本的子串**——探测只准超、不准漏：
@@ -287,6 +291,10 @@ func probeMask(text string) sanitizeMask {
 			if foldAt(text, i, verbTrainedBy) {
 				verb = verb || inIdentityWindow(youAreAt, i)
 			}
+			// DSH @ 路径说明段的预检：段内不含品牌词，只能靠它自己的字面量命中。
+			if foldAt(text, i, sanitizeDshPathsHint) {
+				m |= maskPaths
+			}
 		}
 	}
 	// 与身份句正则同构："You are" 在前、动词在后且距离在窗口内才算候选，否则
@@ -346,6 +354,11 @@ func sanitizeTextScoped(text string, identity bool) string {
 				text = sanitizeBrandRe.ReplaceAllString(text, sanitizeBrandRepl)
 			}
 		}
+	}
+	// @ 路径说明段：整段同义改写（不分角色，见 sanitizeDshPathsRe 的实测依据）。
+	// 放在句式层之后、KV/header 剥离之前：它改的是长段说明文本，与键值剥离互不影响。
+	if mask&maskPaths != 0 {
+		text = sanitizeDshPathsRe.ReplaceAllString(text, sanitizeDshPathsRepl)
 	}
 	if mask&maskLiteral != 0 {
 		if sanitizeHdrRe.MatchString(text) {
@@ -471,16 +484,25 @@ func sanitizeMessages(messages []any) bool {
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		// identity 按角色判定：只有身份载体才走句式层（见 identityRole）。
 		identity := identityRole(m["role"])
+		// assistant 正文是「上游注入身份指令」的回流载体：模型在上一轮把服务端注入的
+		// 身份句（"…identify yourself as …"）复述进思维链 / 正文，客户端把它带回历史，
+		// 下一轮原样出站即命中。system / user 里的同形句是用户自己写的人设，不洗
+		// （见 scrubInjectedIdentity 的作用域说明）。
+		var contentPost func(string) string
+		if role, _ := m["role"].(string); role == "assistant" {
+			contentPost = scrubInjectedIdentity
+		}
 		if c, ok := m["content"]; ok {
-			if nc, ch := sanitizeContentScoped(c, identity); ch {
+			if nc, ch := sanitizeContentPost(c, identity, contentPost); ch {
 				m["content"] = nc
 				changed = true
 			}
 		}
 		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
 		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
+		// 注入身份指令的复述也走这里（它是滚雪球的主要载体）。
 		if rc, ok := m["reasoning_content"].(string); ok {
-			if s := sanitizeTextScoped(rc, false); s != rc {
+			if s := scrubInjectedIdentity(sanitizeTextScoped(rc, false)); s != rc {
 				m["reasoning_content"] = s
 				changed = true
 			}
@@ -490,7 +512,7 @@ func sanitizeMessages(messages []any) bool {
 		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
 		// 裸 "11128" 这种反探测串同样致命。
 		if r, ok := m["reasoning"].(string); ok {
-			if s := sanitizeTextScoped(r, false); s != r {
+			if s := scrubInjectedIdentity(sanitizeTextScoped(r, false)); s != r {
 				m["reasoning"] = s
 				changed = true
 			}

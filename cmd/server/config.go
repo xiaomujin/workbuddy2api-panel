@@ -154,6 +154,40 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	// Repair 11-128 修复阶梯（passthrough 保真模式下的分级抢救）。
+	//
+	// 为什么需要它：上游对内容/渠道拦截按「连续原文」匹配而不是语义审核，一次 400
+	// 就把整站 system 换成中性提示词到次日（模型随即"变笨"）是最粗暴的处理。阶梯
+	// 把它换成逐级加大干预：L2 拆句（一字不改）→ L3 搬家（一字不改）→ L4 局部降级
+	// （只影响同一段指纹的请求，短 TTL）。
+	Repair struct {
+		Enabled           bool `json:"enabled"`             // 缺省 true；false = 退回"一次 400 直接降级"
+		EnsureSystemFirst bool `json:"ensure_system_first"` // L0：首条必须是 system（渠道校验硬要求）
+		SplitSystem       bool `json:"split_system"`        // L2：按句界拆 system
+		MoveSystemToUser  bool `json:"move_system_to_user"` // L3：system 原文搬进首条 user
+		Budget            int  `json:"budget"`              // 每请求修复次数上限（附加在上限换号次数之外）
+		// DegradeTTL L4 段级降级 TTL，默认 "30m"；"day"/"0" = 到次日 00:00 CST（老行为）。
+		DegradeTTL string `json:"degrade_ttl"`
+		// GlobalFallbackTTL realm 级兜底 TTL，默认 "30m"；"0" = 关闭兜底。
+		GlobalFallbackTTL string `json:"global_fallback_ttl"`
+		// FallbackThreshold 15 分钟内多少个**不同段**全阶梯失败才触发 realm 兜底，默认 3；0 = 关闭。
+		FallbackThreshold int `json:"global_fallback_threshold"`
+		// DumpDir 全阶梯失败的现场落盘目录（空 = 不落盘）。只写 system 文本与角色序列，
+		// 不写 user / assistant 内容；产物喂给 internal/probe/probe_repair.go 离线二分。
+		// 相对路径按 state 文件所在目录解析。
+		DumpDir string `json:"dump_dir"`
+		Memory            struct {
+			Enabled bool `json:"enabled"` // 段指纹记忆（落盘、可人工灌库）
+			// Path 记忆文件路径，空 = 与 state 文件同目录的 repair-memory.json。
+			Path string `json:"path"`
+			// PreapplyAfter 同一段命中多少次后，后续请求直接预置该级（省一次 400 往返）。
+			PreapplyAfter int `json:"preapply_after"`
+		} `json:"memory"`
+	} `json:"repair"`
+	// 解析后的 repair 时长（normalize 填充；负值 = "到次日 00:00" 哨兵）。
+	RepairDegradeTTLDur  time.Duration `json:"-"`
+	RepairFallbackTTLDur time.Duration `json:"-"`
+
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
 		// custom = 网关用自有系统提示词替换客户端 system/developer；
@@ -272,6 +306,23 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// 修复阶梯缺省全开：它是"误报处理"，不是对抗手段——默认开启让合法流量不因
+	// 上游的逐字指纹被误杀；显式 false 才退回"一次 400 直接降级"的老行为。
+	c.Repair.Enabled = true
+	c.Repair.EnsureSystemFirst = true
+	c.Repair.SplitSystem = true
+	c.Repair.MoveSystemToUser = true
+	c.Repair.Budget = 3
+	c.Repair.DegradeTTL = "30m"
+	c.Repair.GlobalFallbackTTL = "30m"
+	c.Repair.FallbackThreshold = 3
+	c.Repair.Memory.Enabled = true
+	c.Repair.Memory.Path = "" // 空 = 与 state 文件同目录（装配期解析）
+	c.Repair.Memory.PreapplyAfter = 2
+	// 现场落盘缺省开（相对 state 目录的 dump/）：全阶梯失败的样本是"人工灌库"工作流的
+	// 唯一输入，默认关掉等于让运维下次还要现场复现。安全性由两件事保证：只写 system
+	// 文本与角色序列（不含用户内容）、同一段只写一份且上限 200 段（见 repair_dump.go）。
+	c.Repair.DumpDir = "dump"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -529,6 +580,56 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	// 修复阶梯（repair 段）：
+	//   degrade_ttl 支持 "day"/"0"（= 到次日 00:00 CST 的老行为，映射成负哨兵 -1）
+	//   或普通时长（钳到 [5m, 24h]）；空值回落默认 30m。
+	//   global_fallback_ttl "0" = 关闭兜底（合法值，不回落）；空值回落 30m。
+	switch strings.ToLower(strings.TrimSpace(c.Repair.DegradeTTL)) {
+	case "":
+		c.Repair.DegradeTTL = "30m"
+		c.RepairDegradeTTLDur = 30 * time.Minute
+	case "day", "0":
+		c.Repair.DegradeTTL = "day"
+		c.RepairDegradeTTLDur = -1 // 哨兵：run 侧映射成"到次日 00:00"
+	default:
+		d, derr := time.ParseDuration(c.Repair.DegradeTTL)
+		if derr != nil {
+			return fmt.Errorf("repair.degrade_ttl: %w", derr)
+		}
+		if d < 5*time.Minute {
+			d = 5 * time.Minute
+		}
+		if d > 24*time.Hour {
+			d = 24 * time.Hour
+		}
+		c.RepairDegradeTTLDur = d
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Repair.GlobalFallbackTTL)) {
+	case "0", "off", "false", "disabled":
+		c.Repair.GlobalFallbackTTL = "0"
+		c.RepairFallbackTTLDur = 0
+	case "":
+		c.Repair.GlobalFallbackTTL = "30m"
+		c.RepairFallbackTTLDur = 30 * time.Minute
+	default:
+		d, derr := time.ParseDuration(c.Repair.GlobalFallbackTTL)
+		if derr != nil {
+			return fmt.Errorf("repair.global_fallback_ttl: %w", derr)
+		}
+		if d < 0 {
+			d = 0
+		}
+		c.RepairFallbackTTLDur = d
+	}
+	if c.Repair.Budget <= 0 {
+		c.Repair.Budget = 3
+	}
+	if c.Repair.FallbackThreshold < 0 {
+		c.Repair.FallbackThreshold = 0
+	}
+	if c.Repair.Memory.PreapplyAfter <= 0 {
+		c.Repair.Memory.PreapplyAfter = 2
 	}
 	// 连败降权参数缺省归一（非法/未设置回落默认，与 breaker_threshold 同风格）。
 	if c.Pool.DegradeThreshold <= 0 {

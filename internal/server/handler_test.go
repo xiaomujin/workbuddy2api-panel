@@ -1469,7 +1469,7 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 	// 降级粘性：新请求 Active()=true，body 已被 Rewrite(Degraded)，上游首字节即 200。
 	// 但 fake 上游只对 firstCall 返回 400，之后都 200，无法区分"直达"与"重试"。
 	// 用 degrade.Active() 直接断言粘性生效。
-	if !h.degrade.Active() {
+	if !h.degrade.ActiveAny("") {
 		t.Fatal("degrade should be active after trigger")
 	}
 }
@@ -1510,7 +1510,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "gateway_hint") {
 		t.Errorf("content_blocked should carry gateway_hint: %s", rec.Body.String())
 	}
-	if h.degrade.Active() {
+	if h.degrade.ActiveAny("") {
 		t.Error("degrade should NOT be active in custom mode")
 	}
 }
@@ -2021,7 +2021,7 @@ func TestStatusReportsDegradeWindow(t *testing.T) {
 		t.Errorf("degrade_until=%v want null", before["degrade_until"])
 	}
 
-	h.degrade.Trigger()
+	h.degrade.Trigger("cn", "seg-test")
 	after := read()
 	if after["degrade_active"] != true {
 		t.Errorf("degrade_active=%v want true", after["degrade_active"])

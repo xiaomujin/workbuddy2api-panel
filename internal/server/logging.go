@@ -70,6 +70,12 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// 修复阶梯观测：本次请求被 11-128 阶梯救回来时的级别与段指纹（0 = 未修复）。
+	// 为什么必须落日志：结构级修复「一字不改」，客户端那边完全无感；没有这两个字段，
+	// 「模型行为微变 / 偶发多一次上游调用」就只能靠猜。
+	repairLevel int
+	repairSeg   string
+
 	logged bool
 }
 
@@ -89,7 +95,27 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent, s.repairTag())
+}
+
+// repairTag 把修复级别与段指纹压成一个日志标记（未修复时为空串）。
+func (s *chatStat) repairTag() string {
+	if s == nil || s.repairLevel == 0 {
+		return ""
+	}
+	lvl := "L?"
+	switch s.repairLevel {
+	case 2:
+		lvl = "L2"
+	case 3:
+		lvl = "L3"
+	case 4:
+		lvl = "L4"
+	}
+	if s.repairSeg == "" {
+		return lvl
+	}
+	return lvl + ":" + s.repairSeg
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -422,6 +448,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.RepairLevel = s.repairLevel
+		e.RepairSeg = s.repairSeg
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
@@ -487,14 +515,14 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent, repair string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -543,6 +571,11 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 			ua = `"` + s + `"`
 		}
 		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
+	}
+	// 修复阶梯标记：只有真发生过结构级修复才追加，常态行格式零变化。
+	// 形如 ` repair=L2:a1b2c3d4 |`——级别 + 段指纹前 8 位即可定位"是哪一段被改了"。
+	if repair != "" {
+		extra += fmt.Sprintf(" repair=%s |", repair)
 	}
 	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
 		seq,

@@ -44,58 +44,146 @@ func TestNextMidnightCSTCrossMonth(t *testing.T) {
 	}
 }
 
-// TestDegradeGateActiveTriggered Active() 在 Trigger 后为 true，过期后为 false。
-func TestDegradeGateActiveTriggered(t *testing.T) {
+// TestDegradeGateKeyedIsolation 降级作用域隔离：一段降级不影响同 realm 的其它段，
+// 更不影响别的 realm。这是本次重构的核心语义（旧实现是进程级单例）。
+func TestDegradeGateKeyedIsolation(t *testing.T) {
 	var g degradeGate
-	if g.Active() {
-		t.Error("fresh gate should not be active")
+	g.configure(30*time.Minute, 30*time.Minute, 3)
+	if g.Active("cn", "segA") {
+		t.Fatal("fresh gate should not be active")
 	}
-	g.Trigger()
-	if !g.Active() {
-		t.Error("after Trigger should be active")
+	g.Trigger("cn", "segA")
+	if !g.Active("cn", "segA") {
+		t.Fatal("触发的段应处于降级期")
+	}
+	if g.Active("cn", "segB") {
+		t.Fatal("同 realm 的其它段不该被降级（这正是要修掉的污染）")
+	}
+	if g.Active("global", "segA") {
+		t.Fatal("别的 realm 不该被降级")
 	}
 }
 
-// TestDegradeGateTriggerNoRenewal 降级期内再次 Trigger 不续期（保持最早触发点的 00:00 重置）。
+// TestDegradeGateTriggerNoRenewal 降级期内再次 Trigger 不续期。
 func TestDegradeGateTriggerNoRenewal(t *testing.T) {
 	var g degradeGate
-	g.Trigger()
-	first := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
-	}()
-	// 再次 Trigger：仍在降级期内，until 不应改变。
-	g.Trigger()
-	second := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
-	}()
-	if !first.Equal(second) {
+	g.configure(30*time.Minute, 30*time.Minute, 3)
+	g.Trigger("cn", "segA")
+	first := g.entries[degradeKey{"cn", "segA"}]
+	g.Trigger("cn", "segA")
+	if second := g.entries[degradeKey{"cn", "segA"}]; !first.Equal(second) {
 		t.Errorf("Trigger during active should not renew: first=%v second=%v", first, second)
 	}
 }
 
-// TestDegradeGateSnapshot 只读快照：未触发 → (false, 零值)；触发后 → (true, 次日 00:00)。
-// 这个快照是「降级可见性」的唯一出口（/status 与面板 overview 都走它）。
-func TestDegradeGateSnapshot(t *testing.T) {
+// TestDegradeGateTTLExpiry 短 TTL 到期后自动恢复（不再锁到次日 00:00）。
+func TestDegradeGateTTLExpiry(t *testing.T) {
+	var g degradeGate
+	g.configure(20*time.Millisecond, 30*time.Minute, 3)
+	g.Trigger("cn", "segA")
+	if !g.Active("cn", "segA") {
+		t.Fatal("刚触发应生效")
+	}
+	time.Sleep(40 * time.Millisecond)
+	if g.Active("cn", "segA") {
+		t.Fatal("TTL 到期后应自动恢复")
+	}
+	if active, until := g.Snapshot(); active || !until.IsZero() {
+		t.Fatalf("过期项应被清扫，snapshot=(%v,%v)", active, until)
+	}
+}
+
+// TestDegradeGateDayCompat ttl=0 时回退"到次日 00:00 CST"的老行为。
+func TestDegradeGateDayCompat(t *testing.T) {
+	var g degradeGate
+	g.configure(0, 0, 0)
+	g.Trigger("cn", "segA")
+	until := g.entries[degradeKey{"cn", "segA"}]
+	cst := time.FixedZone("CST", 8*60*60)
+	if u := until.In(cst); u.Hour() != 0 || u.Minute() != 0 {
+		t.Fatalf("day 兼容模式下 until=%v，应落在 CST 00:00", u)
+	}
+}
+
+// TestDegradeGateGlobalFallback 同一 realm 内多个不同段全阶梯失败 → 该 realm 全局兜底。
+func TestDegradeGateGlobalFallback(t *testing.T) {
+	var g degradeGate
+	g.configure(30*time.Minute, 30*time.Minute, 3)
+	if g.NoteFailure("cn", "segA") {
+		t.Fatal("1 段不该触发兜底")
+	}
+	if g.NoteFailure("cn", "segB") {
+		t.Fatal("2 段不该触发兜底（阈值 3）")
+	}
+	if !g.NoteFailure("cn", "segC") {
+		t.Fatal("第 3 个不同段应触发 realm 兜底")
+	}
+	if !g.Active("cn", "anyOtherSeg") {
+		t.Fatal("兜底后该 realm 的任意段都应视为降级")
+	}
+	if g.Active("global", "anyOtherSeg") {
+		t.Fatal("兜底不该跨 realm")
+	}
+}
+
+// TestDegradeGateSameFailureNotCountedTwice 同一个段反复失败只算一段。
+func TestDegradeGateSameFailureNotCountedTwice(t *testing.T) {
+	var g degradeGate
+	g.configure(30*time.Minute, 30*time.Minute, 2)
+	g.NoteFailure("cn", "segA")
+	if g.NoteFailure("cn", "segA") {
+		t.Fatal("同一段重复失败不该凑数触发兜底")
+	}
+}
+
+// TestDegradeGateClear 一键清：按段清 / 按 realm 清 / 全清。
+func TestDegradeGateClear(t *testing.T) {
+	var g degradeGate
+	g.configure(30*time.Minute, 30*time.Minute, 3)
+	g.Trigger("cn", "segA")
+	g.Trigger("cn", "segB")
+	g.Trigger("global", "segC")
+
+	if n := g.Clear("cn", "segA"); n != 1 {
+		t.Fatalf("按段清 n=%d want 1", n)
+	}
+	if g.Active("cn", "segA") {
+		t.Fatal("segA 应已清除")
+	}
+	if !g.Active("cn", "segB") {
+		t.Fatal("segB 不该被连带清除")
+	}
+	if n := g.Clear("cn", ""); n != 1 {
+		t.Fatalf("按 realm 清 n=%d want 1", n)
+	}
+	if g.ActiveAny("") == false {
+		t.Fatal("global 域仍在降级，ActiveAny 应为 true")
+	}
+	if n := g.Clear("", ""); n != 1 {
+		t.Fatalf("全清 n=%d want 1", n)
+	}
+	if active, _ := g.Snapshot(); active {
+		t.Fatal("全清后不该还有降级")
+	}
+}
+
+// TestDegradeGateSnapshotAndScopes 快照聚合与作用域列表（面板/status 的唯一出口）。
+func TestDegradeGateSnapshotAndScopes(t *testing.T) {
 	var g degradeGate
 	if active, until := g.Snapshot(); active || !until.IsZero() {
 		t.Fatalf("fresh gate snapshot = (%v, %v), want (false, zero)", active, until)
 	}
-	g.Trigger()
+	g.configure(30*time.Minute, 30*time.Minute, 3)
+	g.Trigger("cn", "segA")
 	active, until := g.Snapshot()
-	if !active {
-		t.Fatal("Trigger 后 Snapshot 应报告 active")
+	if !active || until.IsZero() {
+		t.Fatalf("Trigger 后 snapshot=(%v,%v)", active, until)
 	}
-	if until.IsZero() {
-		t.Fatal("active 时 until 不能是零值（面板要显示恢复时刻）")
+	scopes := g.Scopes()
+	if len(scopes) != 1 {
+		t.Fatalf("scopes=%d want 1", len(scopes))
 	}
-	g.mu.Lock()
-	want := g.until
-	g.mu.Unlock()
-	if !until.Equal(want) {
-		t.Errorf("Snapshot until=%v want %v", until, want)
+	if scopes[0].Realm != "cn" || scopes[0].Seg != "segA" {
+		t.Fatalf("scope=%+v", scopes[0])
 	}
 }

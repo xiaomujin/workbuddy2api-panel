@@ -351,6 +351,7 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
+  if (v === 'logs') loadRepairMemory();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
@@ -512,12 +513,17 @@ async function loadOverview(quiet) {
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     // 提示词降级（degrade_active）：降级期出站 system prompt 已被**静默**换成中性提示词，
     // 客户端只表现为「模型变笨了」。不显式提示的话这类故障只能靠人猜，所以这里必须亮出来。
+    // 现在降级是**按作用域**（域 + system 指纹段 + 短 TTL），所以要带出「几段」，
+    // 而不是只显示一个全局倒计时——否则运维分不清「一个客户端的指纹」与「整个域被封」。
     if ($('navDegradeRow')) {
       $('navDegradeRow').style.display = d.degrade_active ? '' : 'none';
       if (d.degrade_active && $('navDegrade')) {
+        const scopes = d.degrade_scopes || [];
         const until = d.degrade_until ? new Date(d.degrade_until) : null;
-        const when = until && !isNaN(until) ? until.toLocaleString('zh-CN', { hour12: false }) : '次日 00:00';
-        $('navDegrade').textContent = '提示词降级中 · 至 ' + when;
+        const when = until && !isNaN(until) ? until.toLocaleString('zh-CN', { hour12: false }) : '到期自动恢复';
+        const realmWide = scopes.some((s) => s && s.realm_wide);
+        const label = scopes.length > 1 ? '（' + scopes.length + ' 段）' : '';
+        $('navDegrade').textContent = '提示词降级中' + label + (realmWide ? ' · 全域兜底' : '') + ' · 至 ' + when;
       }
     }
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
@@ -1226,6 +1232,83 @@ $('btnRefresh').onclick = async () => {
   finally { b.disabled = false; b.textContent = '刷新'; }
   if (view === 'logs') loadLogs();
 };
+
+/* 一键恢复：清除全部降级作用域。
+   降级是"猜测性地把出站 system 换成中性提示词"，人工确认上游已放行（或换掉了触发
+   指纹）之后应当能立刻复位——此前只能重启进程。 */
+if ($('navDegradeClear')) {
+  $('navDegradeClear').onclick = async (ev) => {
+    ev.stopPropagation();
+    const b = $('navDegradeClear');
+    b.disabled = true;
+    try {
+      const r = await api('degrade/clear', { method: 'POST', body: JSON.stringify({}) });
+      toast('已清除 ' + (r.cleared || 0) + ' 个降级作用域', 'ok');
+      await loadOverview(true);
+    } catch (e) { toast('清除失败：' + e.message, 'err'); }
+    finally { b.disabled = false; }
+  };
+}
+
+/* ── 修复记忆（11-128 保真修复阶梯）──────────────────────────────────
+   auto：某一段 system 指纹在某一级救回成功后自动入库，命中预置阈值后下一次请求
+   直接在首次出站就套用该级（省掉一次必然的 400）。
+   manual：按离线二分（internal/probe/probe_repair.go）的结论手工灌库。
+   两件事都不要静默：来源、命中次数、最近时刻都摆出来，否则"为什么这次的提示词
+   和平时不一样"永远查不到根。 */
+const REPAIR_LEVEL_LABEL = { 2: 'L2 拆句', 3: 'L3 搬家', 4: 'L4 中性提示词' };
+async function loadRepairMemory() {
+  const box = $('repairTable');
+  if (!box) return;
+  try {
+    const d = await api('repair/memory');
+    const entries = d.entries || [];
+    const rows = entries.map((e) =>
+      '<tr><td>' + esc(e.realm || '') + '</td>' +
+      '<td><code>' + esc(e.seg || '') + '</code></td>' +
+      '<td>' + esc(REPAIR_LEVEL_LABEL[e.level] || ('L' + e.level)) + '</td>' +
+      '<td class="num">' + (e.hits || 0) + '</td>' +
+      '<td>' + (e.source === 'manual' ? '人工' : '自动') + '</td>' +
+      '<td>' + esc(e.note || '') + '</td>' +
+      '<td>' + esc(fmtLocalDateTime(new Date(e.last || 0).getTime())) + '</td>' +
+      '<td><button class="xs" data-repair-del="1" data-realm="' + esc(e.realm || '') +
+      '" data-seg="' + esc(e.seg || '') + '">删除</button></td></tr>').join('');
+    box.innerHTML = rows
+      ? '<table class="acc"><thead><tr><th>域</th><th>段指纹</th><th>级别</th>' +
+        '<th class="num">命中</th><th>来源</th><th>备注</th><th>最近</th><th></th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>'
+      : '<p class="note" style="padding:10px">还没有修复记忆：某段在阶梯中救回成功后会自动入库。</p>';
+    if ($('repairNote')) $('repairNote').textContent = entries.length + ' 条';
+  } catch (e) {
+    box.innerHTML = '<p class="note" style="padding:10px">' + esc(e.message) + '</p>';
+  }
+}
+if ($('btnRepairRefresh')) $('btnRepairRefresh').onclick = loadRepairMemory;
+if ($('btnRepairAdd')) $('btnRepairAdd').onclick = async () => {
+  const realm = ($('repairRealm').value || '').trim();
+  const seg = ($('repairSeg').value || '').trim();
+  const level = Number(($('repairLevel') || {}).value || 2);
+  const note = ($('repairNoteInput').value || '').trim();
+  if (!realm || !seg) { toast('域与段指纹都必填（段指纹见 /status 的 degrade_scopes 或请求日志的 repair=L2:<seg>）', 'err'); return; }
+  try {
+    await api('repair/memory', { method: 'POST', body: JSON.stringify({ realm, seg, level, note }) });
+    toast('已灌库：' + realm + ' / ' + seg + ' → ' + (REPAIR_LEVEL_LABEL[level] || level), 'ok');
+    $('repairSeg').value = ''; $('repairNoteInput').value = '';
+    loadRepairMemory();
+  } catch (e) { toast('灌库失败：' + e.message, 'err'); }
+};
+if ($('repairTable')) $('repairTable').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-repair-del]');
+  if (!btn) return;
+  const realm = btn.dataset.realm || '', seg = btn.dataset.seg || '';
+  if (!realm || !seg) return;
+  btn.disabled = true;
+  try {
+    await api('repair/memory?realm=' + encodeURIComponent(realm) + '&seg=' + encodeURIComponent(seg), { method: 'DELETE' });
+    toast('已删除 ' + realm + ' / ' + seg, 'ok');
+    loadRepairMemory();
+  } catch (e) { toast('删除失败：' + e.message, 'err'); btn.disabled = false; }
+});
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {

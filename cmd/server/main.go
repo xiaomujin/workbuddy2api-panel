@@ -284,6 +284,37 @@ func main() {
 			}
 			return h.DegradeSnapshot()
 		},
+		// 修复阶梯运维出口：降级明细 / 一键恢复 / 段指纹记忆（人工灌库）。
+		DegradeScopes: func() []map[string]any {
+			if h == nil {
+				return nil
+			}
+			return h.DegradeScopesView()
+		},
+		DegradeClear: func(realm, seg string) int {
+			if h == nil {
+				return 0
+			}
+			return h.DegradeClear(realm, seg)
+		},
+		RepairMemory: func() []map[string]any {
+			if h == nil {
+				return nil
+			}
+			return h.RepairMemoryView()
+		},
+		RepairAdd: func(realm, seg, model, note string, level int) error {
+			if h == nil {
+				return errors.New("handler not ready")
+			}
+			return h.RepairMemoryAdd(realm, seg, model, note, level)
+		},
+		RepairRemove: func(realm, seg string) error {
+			if h == nil {
+				return errors.New("handler not ready")
+			}
+			return h.RepairMemoryRemove(realm, seg)
+		},
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -320,6 +351,21 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 11-128 修复阶梯：passthrough 保真模式下的分级抢救（L0 归位 / L2 拆句 /
+		// L3 搬家 / L4 局部降级）+ 段指纹记忆。degrade_ttl 为负值是"到次日 00:00"哨兵。
+		Repair: server.RepairConfig{
+			Enabled:           cfg.Repair.Enabled,
+			EnsureSystemFirst: cfg.Repair.EnsureSystemFirst,
+			SplitSystem:       cfg.Repair.SplitSystem,
+			MoveSystemToUser:  cfg.Repair.MoveSystemToUser,
+			Budget:            cfg.Repair.Budget,
+			DegradeTTL:        cfg.RepairDegradeTTLDur,
+			FallbackTTL:       cfg.RepairFallbackTTLDur,
+			FallbackThreshold: cfg.Repair.FallbackThreshold,
+			MemoryEnabled:     cfg.Repair.Memory.Enabled,
+			MemoryPath:        repairMemoryPath(cfg),
+			PreapplyAfter:     cfg.Repair.Memory.PreapplyAfter,
+		},
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -572,4 +618,25 @@ func mergedJSON(m map[string]any) []byte {
 		return []byte("{}")
 	}
 	return b
+}
+
+// repairMemoryPath 段指纹记忆文件路径：配置非空按配置，否则与 state 文件同目录的
+// repair-memory.json（与 output_probes.json 等派生物同一处，备份/迁移只搬一个目录）。
+func repairMemoryPath(cfg *Config) string {
+	if cfg.Repair.Memory.Path != "" {
+		return cfg.Repair.Memory.Path
+	}
+	return stateSibling(cfg.StateFile, "repair-memory.json")
+}
+// repairDumpDir 全阶梯失败的现场落盘目录：配置非空按配置，空 = 不落盘（默认）。
+// 只写 system 文本与角色序列（见 internal/server/repair_dump.go），产物供离线二分。
+func repairDumpDir(cfg *Config) string {
+	if cfg.Repair.DumpDir == "" {
+		return ""
+	}
+	if filepath.IsAbs(cfg.Repair.DumpDir) {
+		return cfg.Repair.DumpDir
+	}
+	// 相对路径按 state 文件所在目录解析：与 data/ 下其它派生物同一处，备份只搬一个目录。
+	return filepath.Join(filepath.Dir(cfg.StateFile), cfg.Repair.DumpDir)
 }

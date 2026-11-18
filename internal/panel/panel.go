@@ -60,6 +60,17 @@ type Config struct {
 	// 只读：触发只发生在网关请求路径上，面板不提供手动开关。
 	DegradeStatus func() (bool, time.Time)
 
+	// DegradeScopes 逐作用域降级明细（realm + 段指纹 + 到期时刻）；nil = 不展示明细。
+	// 与 DegradeStatus 的分工：那个回答"有没有在降级"，这个回答"是谁、哪一段、到几点"。
+	DegradeScopes func() []map[string]any
+	// DegradeClear 清除降级作用域（realm 空 = 全清；seg 空 = 清该 realm 全部），
+	// 返回清除条数。nil = 面板不提供一键恢复。
+	DegradeClear func(realm, seg string) int
+	// RepairMemory 段指纹记忆（人工灌库）三件套；RepairMemory 为 nil 时面板不显示该卡片。
+	RepairMemory func() []map[string]any
+	RepairAdd    func(realm, seg, model, note string, level int) error
+	RepairRemove func(realm, seg string) error
+
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
@@ -154,6 +165,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	// 修复阶梯的运维出口：降级明细 / 一键恢复 / 段指纹记忆（人工灌库）。
+	p.mux.HandleFunc("GET /panel/api/degrade/scopes", p.withAuth(p.degradeScopesHandler))
+	p.mux.HandleFunc("POST /panel/api/degrade/clear", p.withAuth(p.degradeClearHandler))
+	p.mux.HandleFunc("GET /panel/api/repair/memory", p.withAuth(p.repairMemoryHandler))
+	p.mux.HandleFunc("POST /panel/api/repair/memory", p.withAuth(p.repairMemoryAddHandler))
+	p.mux.HandleFunc("DELETE /panel/api/repair/memory", p.withAuth(p.repairMemoryRemoveHandler))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
@@ -274,6 +291,14 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			degradeActive, degradeUntilAny = true, until
 		}
 	}
+	// 逐作用域明细：降级已从"进程级到次日"改成"(realm, 段指纹) + 短 TTL"，
+	// 前端需要能回答"是谁在降级、影响多大、几点恢复"，而不只是一个布尔。
+	var scopesAny any
+	if p.cfg.DegradeScopes != nil {
+		if scopes := p.cfg.DegradeScopes(); len(scopes) > 0 {
+			scopesAny = scopes
+		}
+	}
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
@@ -303,6 +328,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 静默换成中性提示词，客户端只表现为「模型变笨」。前端据此亮橙色标记。
 		"degrade_active": degradeActive,
 		"degrade_until":  degradeUntilAny,
+		// degrade_scopes 逐作用域明细（为空时 null）：前端把"降级中"从一句笼统提示
+		// 变成"哪一段、到几点、可一键恢复"。零回归：只增键。
+		"degrade_scopes": scopesAny,
 	})
 }
 

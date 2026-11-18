@@ -60,6 +60,22 @@
     "mode": "passthrough",
     "file": ""
   },
+  "repair": {
+    "enabled": true,
+    "ensure_system_first": true,
+    "split_system": true,
+    "move_system_to_user": true,
+    "budget": 3,
+    "degrade_ttl": "30m",
+    "global_fallback_ttl": "30m",
+    "global_fallback_threshold": 3,
+    "dump_dir": "dump",
+    "memory": {
+      "enabled": true,
+      "path": "",
+      "preapply_after": 2
+    }
+  },
   "upstash": {
     "url": "",
     "token": ""

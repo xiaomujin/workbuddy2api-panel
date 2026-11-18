@@ -621,7 +621,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
       <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
-      <div class="row" style="margin-top:5px;display:none" id="navDegradeRow"><span class="tag warn" id="navDegrade" title="出站 system prompt 已被换成中性提示词：客户端 system 提示词指纹被上游误判为渠道校验（400）。到期自动恢复，也可重启网关立即恢复。">提示词降级中</span></div>
+      <div class="row" style="margin-top:5px;display:none" id="navDegradeRow"><span class="tag warn" id="navDegrade" title="出站 system prompt 已被换成中性提示词：客户端 system 提示词指纹被上游误判为渠道校验（400）。现在是按「域 + system 指纹段」局部降级、到点自动恢复；也可人工确认上游已放行后点「恢复」立即清除。">提示词降级中</span><button class="xs" id="navDegradeClear" title="立即清除全部降级作用域（用完即恢复原提示词）">恢复</button></div>
     </div>
   </nav>
 
@@ -1092,6 +1092,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
+      <div class="box">
+        <header>
+          <h3>修复记忆 <span class="hint">11-128 保真修复阶梯：某段 system 指纹在某一级救回成功后自动入库（source=auto），也可按离线二分结论手工灌库（source=manual）。命中预置阈值的段会在首次出站时就直接套用该级，省掉一次必然的 400</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="repairNote">—</span>
+          <button class="xs" id="btnRepairRefresh">刷新</button>
+        </header>
+        <div class="fbar">
+          <input id="repairRealm" placeholder="域 cn / global" size="10" aria-label="域">
+          <input id="repairSeg" placeholder="段指纹 seg（8 位）" size="18" aria-label="段指纹">
+          <select id="repairLevel" aria-label="修复级别">
+            <option value="2">2 拆句（一字不改）</option>
+            <option value="3">3 搬家（一字不改）</option>
+            <option value="4">4 中性提示词</option>
+          </select>
+          <input id="repairNoteInput" placeholder="备注（可空，便于日后回看）" size="22" aria-label="备注">
+          <button class="xs" id="btnRepairAdd">灌库</button>
+        </div>
+        <div class="tbl-wrap" id="repairTable"></div>
+      </div>
       <div class="box">
         <header>
           <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>

@@ -83,6 +83,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
 		}
+		// 工具描述同样可能携带身份句（由客户端作者撰写），此前是净化盲区：
+		// 只洗 messages 时 tools[].function.description 整段原样出站。
+		sanitizeTools(obj)
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
