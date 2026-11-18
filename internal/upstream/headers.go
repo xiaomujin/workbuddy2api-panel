@@ -16,12 +16,16 @@ import (
 
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本（5.5.4）。
+	// 白名单头组的 X-IDE-Version）。2026-11-18 对齐真机分发包：
+	// D:\Program Files\WorkBuddy 的 install-manifest.json appVersion 与
+	// cli/product.json genieVersion 均为 5.11.3（此前写的 5.5.4 是旧包版本）。
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.5.4"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI（2.137.1）。
+	defaultClientVersion = "5.11.3"
+	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐真机内置 CLI：
+	// app.asar.unpacked/cli/package.json 的 @genie/agent-cli 2.176.0
+	// （此前写的 2.137.1 与 5.11.3 客户端不配套）。
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.137.1"
+	defaultCliVersion = "2.176.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
