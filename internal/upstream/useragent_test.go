@@ -323,12 +323,12 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	if ua != "WorkBuddy/6.0.0" {
 		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)
 	}
-	if got := c.billingUA(); got != "WorkBuddy/6.0.0" {
+	if got := c.billingUA(a); got != "WorkBuddy/6.0.0" {
 		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
 	}
 	// 显式 SaaS 还原旧行为（不设 UA）。
 	c.ClientName = "SaaS"
-	if got := c.billingUA(); got != "" {
+	if got := c.billingUA(a); got != "" {
 		t.Errorf("billingUA() SaaS = %q want empty", got)
 	}
 }

@@ -15,17 +15,23 @@ import (
 )
 
 const (
-	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
+	// defaultClientVersionCN 出站 WorkBuddy 客户端版本段（UA 的 `<brand>/<ver>` 与
 	// 白名单头组的 X-IDE-Version）。2026-11-18 对齐真机分发包：
 	// D:\Program Files\WorkBuddy 的 install-manifest.json appVersion 与
 	// cli/product.json genieVersion 均为 5.11.3（此前写的 5.5.4 是旧包版本）。
 	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.11.3"
+	defaultClientVersionCN = "5.11.3"
+	// defaultClientVersionGlobal 国际版（WorkBuddyAI 安装）真机版本 5.11.4
+	// （install-manifest.json appVersion / cli/product.json genieVersion）。
+	defaultClientVersionGlobal = "5.11.4"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐真机内置 CLI：
-	// app.asar.unpacked/cli/package.json 的 @genie/agent-cli 2.176.0
-	// （此前写的 2.137.1 与 5.11.3 客户端不配套）。
+	// 两个 build 的 app.asar.unpacked/cli/package.json 都是 @genie/agent-cli 2.176.0
+	// （此前写的 2.137.1 与 5.11.x 客户端不配套）。
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
 	defaultCliVersion = "2.176.0"
+	// 品牌段（UA 前两段）：product.json 的 applicationName。
+	brandNameCN     = "WorkBuddy"
+	brandNameGlobal = "workbuddy-ai"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -40,13 +46,32 @@ func originRefererFor(a *auth.Auth) string {
 	return originRefererCN
 }
 
-// clientVersion 生效的 WorkBuddy 客户端版本：Client.ClientVersion 非空则取之，
-// 否则内置默认 defaultClientVersion。
-func (c *Client) clientVersion() string {
+// brandName 出站 UA 的品牌段（两段同值）：取真机 product.json 的 applicationName。
+// UA 由客户端 main 进程的 WorkbuddyUserAgentHttpInterceptor 拼成
+//
+//	`<applicationName>/<productVersion> <platform>/<platformVersion> CLI/<cliVersion>`
+//
+// （platform === applicationName），productName 只做界面展示、不进 UA。故国际版是
+// `workbuddy-ai/…` 而非界面上的「WorkBuddy AI」——2026-11-18 从 D:\Program Files\
+// WorkBuddyAI 5.11.4 的 app.asar（main/module-base.js）与 cli/product.json 实测。
+func (c *Client) brandName(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return brandNameGlobal
+	}
+	return brandNameCN
+}
+
+// clientVersionFor 生效的客户端版本：Client.ClientVersion 非空则取之（全局覆盖），
+// 否则按 realm 取真机分发包版本——CN 5.11.3（install-manifest.json）、
+// global 5.11.4（WorkBuddyAI 的 install-manifest.json）。
+func (c *Client) clientVersionFor(a *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
 	}
-	return defaultClientVersion
+	if a != nil && a.IsGlobal() {
+		return defaultClientVersionGlobal
+	}
+	return defaultClientVersionCN
 }
 
 // cliVersion 生效的 CLI 版本：Client.CliVersion 非空则取之，否则内置默认 defaultCliVersion。
@@ -58,18 +83,12 @@ func (c *Client) cliVersion() string {
 }
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`。
-// 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
-// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据：
-// `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
-// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
-// "request illegal" 风控。官方无任何 UA 随机化，故默认确定性。
+// `<brand>/<ver> <brand>/<ver> CLI/<cliVer>`，品牌与版本都按 realm 取真机值
+// （CN `WorkBuddy/5.11.3`、global `workbuddy-ai/5.11.4`，CLI 段当前两版同为 2.176.0）。
+// 官方无任何 UA 随机化，故默认确定性。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
-	platform := "WorkBuddy"
-	if a != nil && a.IsGlobal() {
-		platform = "WorkBuddy AI"
-	}
-	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	brand, ver := c.brandName(a), c.clientVersionFor(a)
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + c.cliVersion()
 }
 
 // defaultWorkBuddyUA 返回 CN 形态的默认 UA（默认账号形态即 CN，零回归兼容既有调用/测试）。
@@ -80,7 +99,7 @@ func (c *Client) defaultWorkBuddyUA() string {
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
 // 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
 // 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
-// 未配则走官方桌面端默认形态（global 换 `WorkBuddy AI` 平台段）。
+// 未配则走官方桌面端默认形态（global 换 `workbuddy-ai/5.11.4` 品牌段）。
 func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
@@ -89,13 +108,14 @@ func (c *Client) userAgent(a *auth.Auth) string {
 }
 
 // billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner 显式覆写形态，不带 CLI 段）。默认生效（伪造官方桌面端指纹）；
-// 显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
-func (c *Client) billingUA() string {
+// （官方 banner 显式覆写形态，不带 CLI 段）。品牌固定 `WorkBuddy/`——两版客户端的
+// banner 请求里该前缀都是硬编码，只有版本跟随当前版本。默认生效（伪造官方桌面端
+// 指纹）；显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
+func (c *Client) billingUA(a *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
-	return "WorkBuddy/" + c.clientVersion()
+	return "WorkBuddy/" + c.clientVersionFor(a)
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
@@ -238,7 +258,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		c.injectGlobalChatHeaders(req, a)
 	}
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
-	c.injectAttribution(req)
+	c.injectAttribution(req, a)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
@@ -375,7 +395,7 @@ func (c *Client) attributionClientName() string {
 // + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version，上游用量归因
 // 不再出现 client/agentPurpose 为空的「网关特征」。显式 ClientName="SaaS" 还原旧行为
 // （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
-func (c *Client) injectAttribution(req *http.Request) {
+func (c *Client) injectAttribution(req *http.Request, a *auth.Auth) {
 	name := c.attributionClientName()
 	if name == "SaaS" {
 		req.Header.Set("X-Product", "SaaS")
@@ -384,7 +404,7 @@ func (c *Client) injectAttribution(req *http.Request) {
 	req.Header.Set("X-Agent-Purpose", "conversation")
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
-	req.Header.Set("X-IDE-Version", c.clientVersion())
+	req.Header.Set("X-IDE-Version", c.clientVersionFor(a))
 	req.Header.Set("X-Product", name)
 }
 
@@ -430,7 +450,7 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
-	} else if ua := c.billingUA(); ua != "" {
+	} else if ua := c.billingUA(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
 	if a.UID != "" {

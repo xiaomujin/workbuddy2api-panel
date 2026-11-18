@@ -202,7 +202,7 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		return ch
 	}
 	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
-	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
+	// 按账号 realm 生成（global → `workbuddy-ai/5.11.4`），故必须传 a 而非用常量。
 	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
 	v3IDECh := probeV3(codeBuddyIDEUA)
 	v3CLICh := probeV3(codeBuddyCLIUA)
